@@ -1,0 +1,14 @@
+name: quakescope
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.8
+  - pandas
+  - numpy
+  - obspy
+  - requests
+  - tqdm
+  - pip
+  - pip:
+    - pyocto
