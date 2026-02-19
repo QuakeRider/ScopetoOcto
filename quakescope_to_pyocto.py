@@ -86,18 +86,28 @@ class QuakeScopePicksDownloader:
             Raw picks data from QuakeScope
         """
         from datetime import datetime, timedelta
-        
+
+        def _parse_naive_utc(s):
+            """Parse an ISO datetime string to a naive UTC datetime.
+
+            Handles both timezone-aware strings (e.g. ending in 'Z' or '+00:00',
+            as produced by ObsPy UTCDateTime) and naive strings (e.g. the CLI
+            args '2002-01-01T00:00:00').  All values are treated as UTC, so
+            tzinfo is stripped after parsing to allow consistent comparisons.
+            """
+            return datetime.fromisoformat(s.replace('Z', '+00:00')).replace(tzinfo=None)
+
         # Parse start and end times
-        start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
-        end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
-        
+        start_dt = _parse_naive_utc(start_time)
+        end_dt = _parse_naive_utc(end_time)
+
         # Constrain to station operational period
         if station_start:
-            station_start_dt = datetime.fromisoformat(station_start.replace('Z', '+00:00'))
+            station_start_dt = _parse_naive_utc(station_start)
             start_dt = max(start_dt, station_start_dt)
-        
+
         if station_end:
-            station_end_dt = datetime.fromisoformat(station_end.replace('Z', '+00:00'))
+            station_end_dt = _parse_naive_utc(station_end)
             end_dt = min(end_dt, station_end_dt)
         
         # If station wasn't active during requested period, return empty
