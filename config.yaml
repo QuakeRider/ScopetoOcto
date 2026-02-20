@@ -1,0 +1,55 @@
+# ScopetoOcto Configuration File
+# Run with: python workflow.py --config config.yaml
+# Resume an interrupted run with: python workflow.py --resume ./quakescope_output
+
+# ---------------------------------------------------------------------------
+# Geographic Bounds (required)
+# ---------------------------------------------------------------------------
+minlat: 46.0      # Minimum latitude (decimal degrees)
+maxlat: 49.0      # Maximum latitude (decimal degrees)
+minlon: -125.0    # Minimum longitude (decimal degrees)
+maxlon: -120.0    # Maximum longitude (decimal degrees)
+
+# ---------------------------------------------------------------------------
+# Time Range (required)
+# ---------------------------------------------------------------------------
+start: "2024-01-01T00:00:00"   # Start time (ISO format: YYYY-MM-DDTHH:MM:SS)
+end:   "2024-01-02T00:00:00"   # End time   (ISO format: YYYY-MM-DDTHH:MM:SS)
+
+# ---------------------------------------------------------------------------
+# Station Filtering
+# ---------------------------------------------------------------------------
+networks: null           # Network codes to query. null = all networks.
+                         # Example: [UW, CC, CN]
+channels: "HH?,EH?,BH?" # Channel filter passed to FDSN (wildcards allowed).
+fdsn_client: "IRIS"      # FDSN client name (e.g. IRIS, NCEDC, SCEDC).
+
+# ---------------------------------------------------------------------------
+# Pick Filtering
+# ---------------------------------------------------------------------------
+phases: [P, S]    # Phase types to download. null = all phases.
+min_score: 0.3    # Minimum pick confidence score (0.0–1.0).
+max_score: 1.0    # Maximum pick confidence score (0.0–1.0).
+
+# ---------------------------------------------------------------------------
+# Output Settings
+# ---------------------------------------------------------------------------
+output_dir: "./quakescope_output"  # Directory where results are written.
+organize_by_day: true              # true  = one file per station per day (recommended).
+                                   # false = single combined file, no deduplication.
+output_format: "csv"               # Output file format: csv, parquet, or pickle.
+
+# ---------------------------------------------------------------------------
+# Processing Settings
+# ---------------------------------------------------------------------------
+dedup_time_threshold: 0.5   # Max time separation (seconds) between picks from
+                             # different location codes to be considered duplicates.
+                             # Only used when organize_by_day is true.
+
+channel_priority: null       # Ordered list of 2-letter channel prefixes, best first.
+                             # null uses the built-in default:
+                             #   [HH, BH, EH, SH, HN, CN, EL, SL, EP, DP]
+                             # Example override: [EH, HH, BH]
+
+use_pyocto_projection: true  # true  = use PyOcto's CRS projection (recommended).
+                             # false = fall back to a simple lat/lon approximation.
