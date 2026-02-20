@@ -53,3 +53,17 @@ channel_priority: null       # Ordered list of 2-letter channel prefixes, best f
 
 use_pyocto_projection: true  # true  = use PyOcto's CRS projection (recommended).
                              # false = fall back to a simple lat/lon approximation.
+
+download_chunk_size: "month" # Time window downloaded in a single API call per station.
+                             # Options: day, month, year
+                             #   day   — one request per active day (original behaviour,
+                             #           most conservative, slowest).
+                             #   month — one request per calendar month (default).
+                             #           Good balance: months rarely exceed 10 000 picks
+                             #           and cuts API calls by ~30×.
+                             #   year  — one request per calendar year (fastest).
+                             #           Falls back automatically to month (then day) if
+                             #           a response hits the 10 000-pick API limit.
+                             # In all modes the response is split into per-day files
+                             # exactly as before.  Existing day files are skipped so
+                             # interrupted runs can be resumed safely.

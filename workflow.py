@@ -126,6 +126,7 @@ def download_and_format_picks(
     channel_priority: list = None,
     use_pyocto_projection: bool = True,
     resume: bool = False,
+    download_chunk_size: str = 'month',
 ):
     """
     Download picks from QuakeScope and format for PyOcto.
@@ -172,6 +173,11 @@ def download_and_format_picks(
         When True, load station metadata from the existing output directory
         and skip any stations that were already fully downloaded in a previous
         run (determined by ``picks/download_progress.json``).
+    download_chunk_size : str
+        Time window downloaded in a single API call per station: ``'day'``,
+        ``'month'`` (default), or ``'year'``.  Larger values mean fewer API
+        round-trips and faster downloads.  Automatic fallback to finer
+        granularity occurs when the 10 000-pick limit is hit.
     """
     print("="*80)
     print(" QuakeScope Pick Downloader" + (" (RESUMING)" if resume else ""))
@@ -227,6 +233,7 @@ def download_and_format_picks(
             'dedup_time_threshold': dedup_time_threshold,
             'channel_priority': channel_priority,
             'use_pyocto_projection': use_pyocto_projection,
+            'download_chunk_size': download_chunk_size,
             'output_dir': str(output_path.absolute()),
         }
         save_run_config(output_path, config)
@@ -312,6 +319,7 @@ def download_and_format_picks(
         dedup_time_threshold=dedup_time_threshold,
         channel_priority=channel_priority,
         resume=resume,
+        chunk_size=download_chunk_size,
     )
 
     # Summary
@@ -448,6 +456,7 @@ See config.yaml for a fully annotated example of all available options.
             dedup_time_threshold=config.get('dedup_time_threshold', 0.5),
             channel_priority=config.get('channel_priority'),
             use_pyocto_projection=config.get('use_pyocto_projection', True),
+            download_chunk_size=config.get('download_chunk_size', 'month'),
             resume=True,
         )
         if result is None:
@@ -481,6 +490,7 @@ See config.yaml for a fully annotated example of all available options.
         dedup_time_threshold=config.get('dedup_time_threshold', 0.5),
         channel_priority=config.get('channel_priority'),
         use_pyocto_projection=config.get('use_pyocto_projection', True),
+        download_chunk_size=config.get('download_chunk_size', 'month'),
         resume=False,
     )
 

@@ -215,6 +215,207 @@ class QuakeScopePicksDownloader:
 
         return []
 
+    def _group_days_into_chunks(
+        self,
+        active_days: List[date],
+        chunk_size: str,
+    ) -> List[Tuple[datetime, datetime, List[date]]]:
+        """Group a list of active days into time chunks for bulk downloading.
+
+        Parameters
+        ----------
+        active_days : list of datetime.date
+            Sorted list of days known to have picks.
+        chunk_size : str
+            ``'day'``, ``'month'``, or ``'year'``.
+
+        Returns
+        -------
+        list of (chunk_start, chunk_end, days_in_chunk)
+            *chunk_start* and *chunk_end* are naive UTC datetimes that span the
+            entire calendar period (e.g. the full month), **before** clamping to
+            the user-requested range.  *days_in_chunk* lists the active days that
+            fall inside the period and is used for recursive fallback.
+        """
+        if not active_days:
+            return []
+
+        if chunk_size == 'day':
+            result = []
+            for d in active_days:
+                start = datetime(d.year, d.month, d.day)
+                end = start + timedelta(days=1)
+                result.append((start, end, [d]))
+            return result
+
+        if chunk_size == 'month':
+            groups: Dict[Tuple[int, int], List[date]] = {}
+            for d in active_days:
+                key = (d.year, d.month)
+                groups.setdefault(key, []).append(d)
+            result = []
+            for (year, month) in sorted(groups):
+                chunk_start = datetime(year, month, 1)
+                if month == 12:
+                    chunk_end = datetime(year + 1, 1, 1)
+                else:
+                    chunk_end = datetime(year, month + 1, 1)
+                result.append((chunk_start, chunk_end, groups[(year, month)]))
+            return result
+
+        if chunk_size == 'year':
+            groups_y: Dict[int, List[date]] = {}
+            for d in active_days:
+                groups_y.setdefault(d.year, []).append(d)
+            result = []
+            for year in sorted(groups_y):
+                chunk_start = datetime(year, 1, 1)
+                chunk_end = datetime(year + 1, 1, 1)
+                result.append((chunk_start, chunk_end, groups_y[year]))
+            return result
+
+        raise ValueError(
+            f"Invalid chunk_size '{chunk_size}'. Must be 'day', 'month', or 'year'."
+        )
+
+    def _download_phase_with_fallback(
+        self,
+        tid: str,
+        chunk_start: datetime,
+        chunk_end: datetime,
+        chunk_size: str,
+        active_days_in_chunk: List[date],
+        phase: Optional[str],
+        min_score: float,
+        max_score: float,
+        channel: Optional[str],
+    ) -> pd.DataFrame:
+        """Download picks for one phase over a time chunk, with automatic fallback.
+
+        If the API returns exactly *max_limit* rows the response is truncated.
+        The method warns and retries at the next finer granularity:
+        ``year → month → day``.  At the ``day`` level it warns but returns the
+        truncated data (consistent with the previous single-day behaviour).
+
+        Parameters
+        ----------
+        tid : str
+            Trace ID.
+        chunk_start, chunk_end : datetime
+            Already-clamped start and end of the window to query.
+        chunk_size : str
+            Current granularity (``'day'``, ``'month'``, or ``'year'``).
+        active_days_in_chunk : list of date
+            Active days within this chunk, used for recursive sub-chunking on
+            fallback.
+        phase : str or None
+            Phase filter passed to the API.
+        min_score, max_score : float
+            Score filter.
+        channel : str or None
+            Channel filter.
+
+        Returns
+        -------
+        pd.DataFrame
+            Raw picks from the API (may be empty).
+        """
+        phase_label = f"phase={phase}" if phase else "all phases"
+        chunk_label = f"{chunk_start.date()} → {chunk_end.date()}"
+
+        params = {
+            'tid': tid,
+            'start_time': chunk_start.strftime('%Y-%m-%dT%H:%M:%S'),
+            'end_time': chunk_end.strftime('%Y-%m-%dT%H:%M:%S'),
+            'min_score': min_score,
+            'max_score': max_score,
+            'limit': self.max_limit,
+        }
+        if phase:
+            params['phase'] = phase
+        if channel:
+            params['channel'] = channel
+
+        try:
+            response = requests.get(self.picks_url, params=params, timeout=30)
+            response.raise_for_status()
+
+            if not response.text.strip():
+                return pd.DataFrame()
+
+            df = pd.read_csv(StringIO(response.text), delimiter='|')
+            if df.empty:
+                return pd.DataFrame()
+
+            if len(df) >= self.max_limit:
+                # Response was truncated — try a finer granularity if possible.
+                fallback_map = {'year': 'month', 'month': 'day'}
+                if chunk_size in fallback_map:
+                    next_size = fallback_map[chunk_size]
+                    print(
+                        f"  WARNING: Hit {self.max_limit}-pick limit for {tid} "
+                        f"[{chunk_label}] ({phase_label}). "
+                        f"Falling back from '{chunk_size}' to '{next_size}' chunks."
+                    )
+                    sub_chunks = self._group_days_into_chunks(
+                        active_days_in_chunk, next_size
+                    )
+                    sub_dfs = []
+                    for sub_start, sub_end, sub_days in sub_chunks:
+                        sub_df = self._download_phase_with_fallback(
+                            tid, sub_start, sub_end, next_size, sub_days,
+                            phase, min_score, max_score, channel,
+                        )
+                        if not sub_df.empty:
+                            sub_dfs.append(sub_df)
+                        time.sleep(0.05)
+                    return pd.concat(sub_dfs, ignore_index=True) if sub_dfs else pd.DataFrame()
+                else:
+                    # Already at 'day' — warn and return truncated data.
+                    print(
+                        f"  WARNING: Hit {self.max_limit}-pick limit at day granularity "
+                        f"for {tid} on {chunk_start.date()} ({phase_label}). "
+                        f"Data may be incomplete. Consider tightening min_score."
+                    )
+
+            return df
+
+        except requests.RequestException as e:
+            print(f"  ERROR downloading {tid} [{chunk_label}] ({phase_label}): {e}")
+            return pd.DataFrame()
+        except pd.errors.EmptyDataError:
+            return pd.DataFrame()
+
+    def _write_chunk_by_day(self, formatted_df: pd.DataFrame) -> None:
+        """Write a formatted picks DataFrame to per-day files, split by date.
+
+        Each calendar day found in *formatted_df* is written to
+        ``output_dir/YYYY-MM-DD/{station_clean}_picks.csv``.  If a file
+        already exists for a station-day it is **skipped** (not overwritten or
+        appended to), so an interrupted run can be resumed safely by simply
+        re-running — days already on disk are left untouched.
+        """
+        df = formatted_df.copy()
+        df['_date'] = pd.to_datetime(df['time'], unit='s').dt.date
+
+        for day_date, day_group in df.groupby('_date'):
+            day_df = day_group.drop(columns=['_date']).reset_index(drop=True)
+            station_name = day_df['station'].iloc[0]
+            station_clean = station_name.replace('.', '_').replace(' ', '_')
+
+            day_dir = self.output_dir / str(day_date)
+            day_dir.mkdir(parents=True, exist_ok=True)
+            filepath = day_dir / f"{station_clean}_picks.csv"
+
+            if filepath.exists():
+                # Already written in a previous (partial) run — skip.
+                continue
+
+            day_df.to_csv(filepath, index=False)
+            print(f"  Wrote {len(day_df)} picks → {day_date}/{filepath.name}")
+            if hasattr(self, '_immediate_files'):
+                self._immediate_files.append(filepath)
+
     def download_picks_for_station(self,
                                    tid: str,
                                    start_time: str,
@@ -225,16 +426,23 @@ class QuakeScopePicksDownloader:
                                    min_score: float = 0.0,
                                    max_score: float = 1.0,
                                    channel: Optional[str] = None,
-                                   write_immediately: bool = False) -> pd.DataFrame:
+                                   write_immediately: bool = False,
+                                   chunk_size: str = 'month') -> pd.DataFrame:
         """
         Download picks for a single station from QuakeScope.
 
         First queries the picks_record endpoint for the full timeframe to
-        discover which days have picks (see get_active_days_for_station).  Only
-        those days are then queried against the picks endpoint, one day at a
-        time, to stay within the 10,000-pick limit.  Days with no picks and
-        days outside the station's operational window are skipped entirely.
-        
+        discover which days have picks (see get_active_days_for_station).
+        Those active days are then grouped into time chunks according to
+        *chunk_size* and each chunk is fetched in a single API call.  If a
+        chunk response hits the 10 000-pick limit the method automatically
+        retries it at the next finer granularity (year → month → day), logging
+        a warning each time.
+
+        When *write_immediately* is True each chunk's picks are formatted and
+        written to ``output_dir/YYYY-MM-DD/`` as soon as they arrive; existing
+        files for a station-day are skipped so interrupted runs resume safely.
+
         Parameters:
         -----------
         tid : str
@@ -254,10 +462,14 @@ class QuakeScopePicksDownloader:
         channel : str, optional
             Channel code filter (e.g., 'EH', 'HH', 'BH')
         write_immediately : bool, optional
-            If True, format and write each day's picks to a CSV file as soon as
-            that day's data is successfully downloaded, rather than holding all
-            picks in memory until the end.  Written paths are appended to
+            If True, format and write each chunk's picks to per-day CSV files as
+            soon as the chunk is downloaded.  Written paths are appended to
             self._immediate_files (if that attribute exists).
+        chunk_size : str, optional
+            Time window per API call: ``'day'``, ``'month'`` (default), or
+            ``'year'``.  Larger chunks mean fewer API calls and faster downloads.
+            Automatic fallback to finer granularity occurs if the 10 000-pick
+            limit is hit.
 
         Returns:
         --------
@@ -267,13 +479,7 @@ class QuakeScopePicksDownloader:
         from datetime import datetime, timedelta
 
         def _parse_naive_utc(s):
-            """Parse an ISO datetime string to a naive UTC datetime.
-
-            Handles both timezone-aware strings (e.g. ending in 'Z' or '+00:00',
-            as produced by ObsPy UTCDateTime) and naive strings (e.g. the CLI
-            args '2002-01-01T00:00:00').  All values are treated as UTC, so
-            tzinfo is stripped after parsing to allow consistent comparisons.
-            """
+            """Parse an ISO datetime string to a naive UTC datetime."""
             return datetime.fromisoformat(s.replace('Z', '+00:00')).replace(tzinfo=None)
 
         # Parse start and end times
@@ -282,23 +488,18 @@ class QuakeScopePicksDownloader:
 
         # Constrain to station operational period
         if station_start:
-            station_start_dt = _parse_naive_utc(station_start)
-            start_dt = max(start_dt, station_start_dt)
-
+            start_dt = max(start_dt, _parse_naive_utc(station_start))
         if station_end:
-            station_end_dt = _parse_naive_utc(station_end)
-            end_dt = min(end_dt, station_end_dt)
-        
+            end_dt = min(end_dt, _parse_naive_utc(station_end))
+
         # If station wasn't active during requested period, return empty
         if start_dt >= end_dt:
             return pd.DataFrame()
-        
-        # Discover which days actually have picks before issuing per-day requests.
-        # A single full-range overview request is made (no phase/channel/score filters)
-        # so we can skip days that are empty and avoid unnecessary API calls.
+
+        # Discover which days actually have picks (picks_record overview call).
         n_total_days = max((end_dt - start_dt).days, 1)
         active_days = self.get_active_days_for_station(tid, start_dt, end_dt, channel=channel)
-        time.sleep(0.05)  # Be nice to the server after the overview request
+        time.sleep(0.05)  # Be courteous to the server
 
         if not active_days:
             return pd.DataFrame()
@@ -306,92 +507,42 @@ class QuakeScopePicksDownloader:
         print(f"  Active days with picks: {len(active_days)}/{n_total_days} "
               f"(skipping {n_total_days - len(active_days)} empty day(s))")
 
+        # Group active days into download chunks
+        chunks = self._group_days_into_chunks(active_days, chunk_size)
+        if chunk_size != 'day':
+            print(f"  Downloading in {len(chunks)} {chunk_size} chunk(s) "
+                  f"(chunk_size='{chunk_size}')")
+
+        phase_list = phases if phases else [None]
         all_picks = []
 
-        # Only iterate over days that are known to have picks
-        for active_date in active_days:
-            day_start = datetime(active_date.year, active_date.month, active_date.day)
-            day_end = day_start + timedelta(days=1)
+        for chunk_start, chunk_end, chunk_active_days in chunks:
+            # Clamp chunk boundaries to the user-requested range
+            clamped_start = max(chunk_start, start_dt)
+            clamped_end = min(chunk_end, end_dt)
 
-            # Clamp to the requested range (handles partial first/last days)
-            chunk_start_dt = max(day_start, start_dt)
-            chunk_end_dt = min(day_end, end_dt)
-
-            chunk_start = chunk_start_dt.strftime('%Y-%m-%dT%H:%M:%S')
-            chunk_end = chunk_end_dt.strftime('%Y-%m-%dT%H:%M:%S')
-
-            # If phases specified, query each phase separately
-            phase_list = phases if phases else [None]
-
-            day_picks = []  # Raw picks collected for this single day (all phases)
+            chunk_picks_raw = []
 
             for phase in phase_list:
-                params = {
-                    'tid': tid,
-                    'start_time': chunk_start,
-                    'end_time': chunk_end,
-                    'min_score': min_score,
-                    'max_score': max_score,
-                    'limit': self.max_limit
-                }
-
-                if phase:
-                    params['phase'] = phase
-                if channel:
-                    params['channel'] = channel
-
-                try:
-                    response = requests.get(self.picks_url, params=params, timeout=30)
-                    response.raise_for_status()
-
-                    # Parse pipe-delimited CSV
-                    if response.text.strip():
-                        df = pd.read_csv(StringIO(response.text), delimiter='|')
-                        if not df.empty:
-                            all_picks.append(df)
-                            day_picks.append(df)
-
-                        # Warn if we hit the limit even with daily chunks
-                        if len(df) >= self.max_limit:
-                            print(f"  WARNING: Hit limit ({self.max_limit}) for {tid} on {active_date}, phase={phase}")
-
-                except requests.RequestException as e:
-                    print(f"  ERROR downloading {tid} on {active_date}, phase={phase}: {e}")
-                except pd.errors.EmptyDataError:
-                    # No data for this query
-                    pass
-
-                # Be nice to the server
+                df = self._download_phase_with_fallback(
+                    tid, clamped_start, clamped_end, chunk_size,
+                    chunk_active_days, phase, min_score, max_score, channel,
+                )
+                if not df.empty:
+                    all_picks.append(df)
+                    chunk_picks_raw.append(df)
                 time.sleep(0.05)
 
-            # Write this day's picks to disk immediately after all phases are done
-            if write_immediately and day_picks:
-                day_df = pd.concat(day_picks, ignore_index=True)
-                formatted_day = self.format_for_pyocto(day_df)
-                if not formatted_day.empty:
-                    # Derive a clean station name from the picks data itself
-                    station_name = formatted_day['station'].iloc[0]
-                    station_clean = station_name.replace('.', '_').replace(' ', '_')
-                    # Place the file inside the pre-created date subdirectory
-                    day_dir = self.output_dir / str(active_date)
-                    day_dir.mkdir(parents=True, exist_ok=True)
-                    filepath = day_dir / f"{station_clean}_picks.csv"
-                    # If a file already exists for this station-day (e.g. from a
-                    # previous partial run), append and re-sort rather than clobber
-                    if filepath.exists():
-                        existing = pd.read_csv(filepath)
-                        formatted_day = pd.concat(
-                            [existing, formatted_day], ignore_index=True
-                        ).sort_values('time').reset_index(drop=True)
-                    formatted_day.to_csv(filepath, index=False)
-                    print(f"  Wrote {len(formatted_day)} picks → {active_date}/{filepath.name}")
-                    if hasattr(self, '_immediate_files'):
-                        self._immediate_files.append(filepath)
+            # Write this chunk's picks to disk split by calendar day
+            if write_immediately and chunk_picks_raw:
+                chunk_df = pd.concat(chunk_picks_raw, ignore_index=True)
+                formatted_chunk = self.format_for_pyocto(chunk_df)
+                if not formatted_chunk.empty:
+                    self._write_chunk_by_day(formatted_chunk)
 
         if all_picks:
             return pd.concat(all_picks, ignore_index=True)
-        else:
-            return pd.DataFrame()
+        return pd.DataFrame()
     
     def download_picks_bulk(self,
                            stations_df: pd.DataFrame,
@@ -402,7 +553,8 @@ class QuakeScopePicksDownloader:
                            max_score: float = 1.0,
                            channel: Optional[str] = None,
                            write_immediately: bool = False,
-                           skip_completed: bool = False) -> pd.DataFrame:
+                           skip_completed: bool = False,
+                           chunk_size: str = 'month') -> pd.DataFrame:
         """
         Download picks for multiple stations.
 
@@ -429,12 +581,15 @@ class QuakeScopePicksDownloader:
             Channel code filter
         write_immediately : bool, optional
             Passed through to download_picks_for_station().  When True, each
-            day's picks are written to a CSV file immediately after download.
+            chunk's picks are written to per-day CSV files immediately.
         skip_completed : bool, optional
             When True, load the progress file and skip any station tid that
             has already been fully downloaded in a previous run.  Progress is
             saved incrementally so a fresh interruption only loses the
             partially-downloaded station currently in flight.
+        chunk_size : str, optional
+            Time window per API call: ``'day'``, ``'month'`` (default), or
+            ``'year'``.  Passed through to download_picks_for_station().
 
         Returns:
         --------
@@ -462,8 +617,9 @@ class QuakeScopePicksDownloader:
         print(f"Requested time range: {start_time} to {end_time} ({n_days} days)")
         print(f"Phases: {phases if phases else 'all'}")
         print(f"Score range: {min_score} to {max_score}")
-        print(f"NOTE: picks_record is queried per station to identify days with picks; "
-              f"only those days are then fetched from the picks endpoint")
+        print(f"Download chunk size : {chunk_size} "
+              f"(picks_record used to discover active days; "
+              f"bulk {chunk_size} queries issued per station)")
 
         all_picks = []
 
@@ -496,7 +652,8 @@ class QuakeScopePicksDownloader:
                 min_score=min_score,
                 max_score=max_score,
                 channel=channel,
-                write_immediately=write_immediately
+                write_immediately=write_immediately,
+                chunk_size=chunk_size,
             )
             if not picks.empty:
                 all_picks.append(picks)
@@ -904,7 +1061,8 @@ class QuakeScopePicksDownloader:
             output_format: str = 'csv',
             dedup_time_threshold: float = 0.5,
             channel_priority: Optional[List[str]] = None,
-            resume: bool = False) -> List[Path]:
+            resume: bool = False,
+            chunk_size: str = 'month') -> List[Path]:
         """
         Complete workflow: download, format, organize, deduplicate, and save picks.
 
@@ -955,6 +1113,11 @@ class QuakeScopePicksDownloader:
             directory and skip any station tids that were already fully
             downloaded in a previous run.  Use this when restarting an
             interrupted download via ``--resume``.
+        chunk_size : str, optional
+            Time window per API call: ``'day'``, ``'month'`` (default), or
+            ``'year'``.  Larger values mean fewer round-trips and faster
+            downloads.  Automatic fallback to finer granularity occurs when
+            the 10 000-pick limit is hit.
 
         Returns:
         --------
@@ -983,6 +1146,7 @@ class QuakeScopePicksDownloader:
             channel=channel,
             write_immediately=organize_by_day,
             skip_completed=resume,
+            chunk_size=chunk_size,
         )
 
         if organize_by_day:
