@@ -11,5 +11,8 @@ dependencies:
   - tqdm
   - pip
   - pyyaml
+  - matplotlib
+  - cartopy
+  - pyproj
   - pip:
     - pyocto
