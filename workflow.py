@@ -162,7 +162,7 @@ def download_and_format_picks(
     print(f"  - PyOcto stations:  {pyocto_stations_file.name}")
     if crs:
         print(f"  - CRS information:  crs_info.json")
-    print(f"  - Pick files:       {len(pick_files)} files in picks/")
+    print(f"  - Pick files:       {len(pick_files)} files in picks/YYYY-MM-DD/ subdirectories")
     
     if crs:
         print(f"\nCoordinate Reference System:")
