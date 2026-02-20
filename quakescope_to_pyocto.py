@@ -39,22 +39,27 @@ class QuakeScopePicksDownloader:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # QuakeScope API endpoint
+        # QuakeScope API endpoints
         self.picks_url = "https://dasway.ess.washington.edu/quakescope/service/picks/query"
-        
+        self.picks_record_url = "https://dasway.ess.washington.edu/quakescope/service/picks_record/query"
+
         # Maximum picks per query (QuakeScope limit)
         self.max_limit = 10000
     
     def get_active_days_for_station(self,
                                     tid: str,
                                     start_dt: datetime,
-                                    end_dt: datetime) -> List[date]:
+                                    end_dt: datetime,
+                                    channel: Optional[str] = None) -> List[date]:
         """
-        Discover which days within a timeframe actually have picks for a station.
+        Query the picks_record API to discover which days have picks for a station.
 
-        Makes a single full-timeframe request (without phase/channel/score filters)
-        and parses the response to extract the unique dates that contain picks.
-        This avoids issuing per-day requests for days with no data.
+        The picks_record endpoint returns a lightweight daily summary of pick
+        counts per station — one row per day that has picks — so it is far
+        cheaper than querying the picks endpoint directly.  Every date that
+        appears in the response has at least one pick and will be queried in
+        detail by download_picks_for_station; days absent from the response are
+        skipped entirely.
 
         Parameters:
         -----------
@@ -64,6 +69,10 @@ class QuakeScopePicksDownloader:
             Start of the timeframe (naive UTC)
         end_dt : datetime
             End of the timeframe (naive UTC)
+        channel : str, optional
+            Two-letter channel prefix (e.g. 'HH', 'EH').  When provided the
+            picks_record query is filtered to that channel so only days with
+            picks on the requested channel are returned.
 
         Returns:
         --------
@@ -73,26 +82,58 @@ class QuakeScopePicksDownloader:
         """
         params = {
             'tid': tid,
-            'start_time': start_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-            'end_time': end_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-            'limit': self.max_limit
+            'start_time': start_dt.strftime('%Y-%m-%d'),
+            'end_time': end_dt.strftime('%Y-%m-%d'),
         }
+        if channel:
+            params['channel'] = channel
 
         try:
-            response = requests.get(self.picks_url, params=params, timeout=30)
+            response = requests.get(self.picks_record_url, params=params, timeout=30)
             response.raise_for_status()
 
-            if response.text.strip():
-                df = pd.read_csv(StringIO(response.text), delimiter='|')
-                if not df.empty and 'peak_time' in df.columns:
-                    if len(df) >= self.max_limit:
-                        print(f"  NOTE: Overview request hit limit ({self.max_limit}) for {tid}; "
-                              f"some active days may be missed in the pre-filter step")
-                    dates = sorted(pd.to_datetime(df['peak_time']).dt.date.unique())
-                    return dates
+            if not response.text.strip():
+                return []
+
+            df = pd.read_csv(StringIO(response.text), delimiter='|')
+            if df.empty:
+                return []
+
+            # Identify the date column — picks_record returns one row per day.
+            # Try an exact match first, then a case-insensitive substring search,
+            # then fall back to trying to parse each column as dates.
+            date_col = None
+            col_names_lower = [c.lower().strip() for c in df.columns]
+
+            for candidate in ('date', 'day', 'start_time', 'time'):
+                if candidate in col_names_lower:
+                    date_col = df.columns[col_names_lower.index(candidate)]
+                    break
+
+            if date_col is None:
+                for col in df.columns:
+                    if 'date' in col.lower() or 'time' in col.lower():
+                        date_col = col
+                        break
+
+            if date_col is None:
+                # Last resort: find the first column that parses as dates
+                for col in df.columns:
+                    parsed = pd.to_datetime(df[col], errors='coerce')
+                    if parsed.notna().all():
+                        date_col = col
+                        break
+
+            if date_col is None:
+                print(f"  WARNING: Could not identify a date column in picks_record "
+                      f"response for {tid}. Columns: {df.columns.tolist()}")
+                return []
+
+            dates = sorted(pd.to_datetime(df[date_col]).dt.date.dropna().unique())
+            return dates
 
         except requests.RequestException as e:
-            print(f"  WARNING: Could not fetch overview for {tid}: {e}. "
+            print(f"  WARNING: Could not fetch picks_record for {tid}: {e}. "
                   f"Falling back to querying all days.")
         except pd.errors.EmptyDataError:
             pass
@@ -112,11 +153,11 @@ class QuakeScopePicksDownloader:
         """
         Download picks for a single station from QuakeScope.
 
-        First makes a single full-range overview request to discover which days
-        have picks (see get_active_days_for_station).  Only those days are then
-        queried in detail, chunked by day to stay within the 10,000-pick limit.
-        Days with no picks and days outside the station's operational window are
-        skipped entirely.
+        First queries the picks_record endpoint for the full timeframe to
+        discover which days have picks (see get_active_days_for_station).  Only
+        those days are then queried against the picks endpoint, one day at a
+        time, to stay within the 10,000-pick limit.  Days with no picks and
+        days outside the station's operational window are skipped entirely.
         
         Parameters:
         -----------
@@ -175,7 +216,7 @@ class QuakeScopePicksDownloader:
         # A single full-range overview request is made (no phase/channel/score filters)
         # so we can skip days that are empty and avoid unnecessary API calls.
         n_total_days = max((end_dt - start_dt).days, 1)
-        active_days = self.get_active_days_for_station(tid, start_dt, end_dt)
+        active_days = self.get_active_days_for_station(tid, start_dt, end_dt, channel=channel)
         time.sleep(0.05)  # Be nice to the server after the overview request
 
         if not active_days:
@@ -255,12 +296,12 @@ class QuakeScopePicksDownloader:
         """
         Download picks for multiple stations.
 
-        For each station an overview request is first made covering the full
-        timeframe to discover which days actually have picks.  Only those days
-        are then queried in detail (per-day, per-phase), skipping days with no
-        data.  This avoids issuing unnecessary requests when picks are sparse
-        across the requested range.  Station operational periods are also
-        respected so no requests are made outside the station's active window.
+        For each station the picks_record endpoint is queried first for the full
+        timeframe to get a lightweight daily summary of pick counts.  Only the
+        days that appear in that summary (i.e. days that have picks) are then
+        queried in detail against the picks endpoint, one day at a time.  Days
+        with no picks and days outside each station's operational window are
+        skipped entirely, minimising unnecessary API calls.
         
         Parameters:
         -----------
@@ -293,8 +334,8 @@ class QuakeScopePicksDownloader:
         print(f"Requested time range: {start_time} to {end_time} ({n_days} days)")
         print(f"Phases: {phases if phases else 'all'}")
         print(f"Score range: {min_score} to {max_score}")
-        print(f"NOTE: An overview request is made per station to find days with picks; "
-              f"only those days are then queried in detail")
+        print(f"NOTE: picks_record is queried per station to identify days with picks; "
+              f"only those days are then fetched from the picks endpoint")
         
         all_picks = []
         
