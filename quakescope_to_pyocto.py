@@ -9,6 +9,7 @@ Author: Grant
 Date: 2025-01-29
 """
 
+import json
 import pandas as pd
 import numpy as np
 from datetime import date, datetime, timedelta
@@ -45,6 +46,39 @@ class QuakeScopePicksDownloader:
 
         # Maximum picks per query (QuakeScope limit)
         self.max_limit = 10000
+
+        # File tracking which station tids have been fully downloaded
+        self._progress_file = self.output_dir / 'download_progress.json'
+
+    def _load_completed_tids(self) -> set:
+        """Return the set of station tids that have been fully downloaded.
+
+        Reads ``download_progress.json`` from the output directory.  Returns an
+        empty set if the file does not exist or cannot be parsed.
+        """
+        if not self._progress_file.exists():
+            return set()
+        try:
+            with open(self._progress_file) as f:
+                data = json.load(f)
+            return set(data.get('completed_tids', []))
+        except Exception as e:
+            print(f"WARNING: Could not read progress file {self._progress_file}: {e}")
+            return set()
+
+    def _mark_tid_complete(self, tid: str) -> None:
+        """Record *tid* as fully downloaded in ``download_progress.json``."""
+        completed = self._load_completed_tids()
+        completed.add(tid)
+        data = {
+            'completed_tids': sorted(completed),
+            'last_updated': datetime.utcnow().isoformat(),
+        }
+        try:
+            with open(self._progress_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"WARNING: Could not write progress file {self._progress_file}: {e}")
 
     def create_day_directories(self, start_time: str, end_time: str) -> List[Path]:
         """
@@ -367,7 +401,8 @@ class QuakeScopePicksDownloader:
                            min_score: float = 0.0,
                            max_score: float = 1.0,
                            channel: Optional[str] = None,
-                           write_immediately: bool = False) -> pd.DataFrame:
+                           write_immediately: bool = False,
+                           skip_completed: bool = False) -> pd.DataFrame:
         """
         Download picks for multiple stations.
 
@@ -395,6 +430,11 @@ class QuakeScopePicksDownloader:
         write_immediately : bool, optional
             Passed through to download_picks_for_station().  When True, each
             day's picks are written to a CSV file immediately after download.
+        skip_completed : bool, optional
+            When True, load the progress file and skip any station tid that
+            has already been fully downloaded in a previous run.  Progress is
+            saved incrementally so a fresh interruption only loses the
+            partially-downloaded station currently in flight.
 
         Returns:
         --------
@@ -402,25 +442,40 @@ class QuakeScopePicksDownloader:
             Combined picks from all stations
         """
         from datetime import datetime
-        
+
         # Calculate time range
         start_dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
         end_dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
         n_days = (end_dt - start_dt).days + 1
-        
+
+        # Resume support: load the set of already-completed station tids.
+        completed_tids: set = self._load_completed_tids() if skip_completed else set()
+        n_completed = len(completed_tids)
+        n_remaining = len(stations_df) - sum(
+            1 for _, row in stations_df.iterrows() if row['tid'] in completed_tids
+        )
+
         print(f"Downloading picks for {len(stations_df)} stations...")
+        if completed_tids:
+            print(f"Resuming: {n_completed} station(s) already complete, "
+                  f"{n_remaining} remaining")
         print(f"Requested time range: {start_time} to {end_time} ({n_days} days)")
         print(f"Phases: {phases if phases else 'all'}")
         print(f"Score range: {min_score} to {max_score}")
         print(f"NOTE: picks_record is queried per station to identify days with picks; "
               f"only those days are then fetched from the picks endpoint")
-        
+
         all_picks = []
-        
+
         for i, (_, row) in enumerate(stations_df.iterrows(), 1):
             tid = row['tid']
             sta_start = row.get('start_date')
             sta_end = row.get('end_date')
+
+            # Skip stations that were fully downloaded in a previous run.
+            if tid in completed_tids:
+                print(f"\n[{i}/{len(stations_df)}] {tid} - SKIPPED (already downloaded)")
+                continue
             
             # Show operational period - convert UTCDateTime to string if needed
             if pd.notna(sta_start) and pd.notna(sta_end):
@@ -448,6 +503,9 @@ class QuakeScopePicksDownloader:
                 print(f"  Downloaded {len(picks)} picks")
             else:
                 print(f"  No picks found")
+
+            # Record this tid as complete so a future --resume can skip it.
+            self._mark_tid_complete(tid)
         
         if all_picks:
             combined = pd.concat(all_picks, ignore_index=True)
@@ -845,7 +903,8 @@ class QuakeScopePicksDownloader:
             organize_by_day: bool = True,
             output_format: str = 'csv',
             dedup_time_threshold: float = 0.5,
-            channel_priority: Optional[List[str]] = None) -> List[Path]:
+            channel_priority: Optional[List[str]] = None,
+            resume: bool = False) -> List[Path]:
         """
         Complete workflow: download, format, organize, deduplicate, and save picks.
 
@@ -891,6 +950,11 @@ class QuakeScopePicksDownloader:
         channel_priority : list of str, optional
             Ordered 2-letter channel prefixes, best first.  Defaults to
             DEFAULT_CHANNEL_PRIORITY.  Only used during dedup.
+        resume : bool, optional
+            When True, load ``download_progress.json`` from the output
+            directory and skip any station tids that were already fully
+            downloaded in a previous run.  Use this when restarting an
+            interrupted download via ``--resume``.
 
         Returns:
         --------
@@ -917,16 +981,21 @@ class QuakeScopePicksDownloader:
             min_score=min_score,
             max_score=max_score,
             channel=channel,
-            write_immediately=organize_by_day
+            write_immediately=organize_by_day,
+            skip_completed=resume,
         )
 
         if organize_by_day:
-            if not self._immediate_files:
+            # On resume, existing pick files may not be in _immediate_files
+            # (they were written in a prior run).  Check disk for any files.
+            existing_files = sorted(self.output_dir.rglob('*_picks.csv'))
+            if not self._immediate_files and not existing_files:
                 print("No picks found for given criteria")
                 return []
 
-            print(f"Downloaded {len(self._immediate_files)} station-day file(s) "
-                  f"across all location codes")
+            if self._immediate_files:
+                print(f"Downloaded {len(self._immediate_files)} station-day file(s) "
+                      f"across all location codes")
 
             # Cross-location dedup pass — runs only when stations_df has the
             # 'physical_station' column produced by get_stations_with_metadata.
@@ -944,9 +1013,10 @@ class QuakeScopePicksDownloader:
                       f"to {self.output_dir}")
                 return merged_files
             else:
-                print(f"\nSaved {len(self._immediate_files)} pick file(s) to "
+                all_files = self._immediate_files or existing_files
+                print(f"\nSaved {len(all_files)} pick file(s) to "
                       f"{self.output_dir}")
-                return self._immediate_files
+                return all_files
 
         # organize_by_day=False: save all picks in a single combined file
         if raw_picks.empty:
