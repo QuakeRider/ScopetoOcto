@@ -14,7 +14,7 @@ This toolkit downloads picks from QuakeScope and prepares them in the format req
 
 ## Important: QuakeScope Limitation
 
-**QuakeScope does NOT support spatial queries for picks.** You cannot query picks directly by lat/lon bounds. 
+**QuakeScope does NOT support spatial queries for picks.** You cannot query picks directly by lat/lon bounds.
 
 Instead, this script:
 1. Gets stations within your lat/lon bounds (via FDSN)
@@ -25,7 +25,7 @@ Instead, this script:
 ### Requirements
 
 ```bash
-pip install pandas numpy obspy requests tqdm pyocto
+pip install pandas numpy obspy requests tqdm pyocto pyyaml
 ```
 
 Or use conda:
@@ -39,19 +39,88 @@ conda activate quakescope
 - `workflow.py` - Main script (run this)
 - `quakescope_to_pyocto.py` - QuakeScope download and formatting
 - `get_stations.py` - FDSN station queries
+- `config.yaml` - Configuration file template
 
 ## Quick Start
 
+1. Edit `config.yaml` with your region, time range, and settings.
+2. Run the workflow:
+
 ```bash
-# Pacific Northwest example
-python workflow.py \
-    --minlat 46 --maxlat 49 \
-    --minlon -125 --maxlon -120 \
-    --networks UW \
-    --start 2024-01-01T00:00:00 \
-    --end 2024-01-02T00:00:00 \
-    --min-score 0.3
+python workflow.py --config config.yaml
 ```
+
+To resume an interrupted download:
+
+```bash
+python workflow.py --resume ./quakescope_output
+```
+
+## Configuration
+
+All settings are controlled through a YAML config file. Copy and edit `config.yaml`:
+
+```yaml
+# Geographic Bounds (required)
+minlat: 46.0
+maxlat: 49.0
+minlon: -125.0
+maxlon: -120.0
+
+# Time Range (required)
+start: "2024-01-01T00:00:00"
+end:   "2024-01-02T00:00:00"
+
+# Station Filtering
+networks: null           # null = all networks. Example: [UW, CC, CN]
+channels: "HH?,EH?,BH?" # Channel filter (wildcards allowed)
+fdsn_client: "IRIS"      # FDSN client (e.g. IRIS, NCEDC, SCEDC)
+
+# Pick Filtering
+phases: [P, S]    # Phase types. null = all phases.
+min_score: 0.3    # Minimum pick confidence (0.0–1.0)
+max_score: 1.0    # Maximum pick confidence (0.0–1.0)
+
+# Output Settings
+output_dir: "./quakescope_output"  # Results directory
+organize_by_day: true              # true = one file per station per day (recommended)
+output_format: "csv"               # csv, parquet, or pickle
+
+# Processing Settings
+dedup_time_threshold: 0.5  # Seconds; picks from different location codes within
+                            # this window are treated as duplicates (keep best channel)
+channel_priority: null      # null uses built-in default: [HH, BH, EH, SH, HN, CN, EL, SL, EP, DP]
+use_pyocto_projection: true # true = PyOcto CRS projection (recommended)
+```
+
+### Configuration Options
+
+#### Geographic Bounds (required)
+- `minlat`, `maxlat`: Latitude bounds (decimal degrees)
+- `minlon`, `maxlon`: Longitude bounds (decimal degrees)
+
+#### Time Range (required)
+- `start`, `end`: ISO format times (`YYYY-MM-DDTHH:MM:SS`)
+
+#### Station Filtering
+- `networks`: List of network codes, or `null` for all networks
+- `channels`: Channel filter string passed to FDSN (wildcards allowed)
+- `fdsn_client`: FDSN client name (`IRIS`, `NCEDC`, `SCEDC`, etc.)
+
+#### Pick Filtering
+- `phases`: List of phase types (`[P, S]`), or `null` for all phases
+- `min_score`: Minimum pick confidence score (default: `0.3`)
+- `max_score`: Maximum pick confidence score (default: `1.0`)
+
+#### Output Settings
+- `output_dir`: Directory where results are written (default: `./quakescope_output`)
+- `organize_by_day`: Write one file per station per day (recommended; enables deduplication)
+- `output_format`: File format for pick files — `csv`, `parquet`, or `pickle`
+
+#### Processing Settings
+- `dedup_time_threshold`: Maximum time difference (seconds) between picks from different location codes at the same physical station to be considered duplicates. The pick from the highest-priority channel is kept. Only applies when `organize_by_day` is `true`.
+- `channel_priority`: Ordered list of 2-letter channel prefixes (best first). `null` uses the built-in default: `[HH, BH, EH, SH, HN, CN, EL, SL, EP, DP]`.
+- `use_pyocto_projection`: Use PyOcto's proper CRS coordinate transformation. Set to `false` to fall back to a simple lat/lon approximation (not recommended for production).
 
 ## Output
 
@@ -61,6 +130,7 @@ quakescope_output/
 ├── station_metadata.csv       # Full station info from FDSN
 ├── pyocto_stations.csv        # Stations in PyOcto format (projected coordinates)
 ├── crs_info.json              # Coordinate Reference System information
+├── run_config.json            # Saved run parameters (used by --resume)
 └── picks/
     ├── 2024-01-01/
     │   ├── UW_STA1__2024-01-01_picks.csv
@@ -79,69 +149,62 @@ Columns: `station`, `x`, `y`, `z` (coordinates in km)
 
 **Projection**: Uses PyOcto's proper coordinate transformation with a local transverse Mercator projection centered on the station distribution. The CRS information is saved in `crs_info.json` for use when creating your associator.
 
-### PyOcto Picks Format  
+### PyOcto Picks Format
 Columns: `station`, `time`, `phase`, `probability`, `amplitude`
 - `station`: station trace ID
 - `time`: Unix timestamp (seconds)
-- `phase`: 'P' or 'S' (uppercase)
-- `probability`: pick score (0-1)
+- `phase`: `'P'` or `'S'` (uppercase)
+- `probability`: pick score (0–1)
 - `amplitude`: pick amplitude (for reference, not used by PyOcto)
 
-## Usage
+## Resuming Interrupted Downloads
 
-### Command Line
+If a download is interrupted, resume it without re-downloading completed stations:
 
 ```bash
-python workflow.py \
-    --minlat MIN_LAT --maxlat MAX_LAT \
-    --minlon MIN_LON --maxlon MAX_LON \
-    --start START_TIME --end END_TIME \
-    [OPTIONS]
+python workflow.py --resume ./quakescope_output
 ```
 
-### Required Arguments
-- `--minlat`, `--maxlat`: Latitude bounds
-- `--minlon`, `--maxlon`: Longitude bounds  
-- `--start`: Start time (ISO format: `YYYY-MM-DDTHH:MM:SS`)
-- `--end`: End time (ISO format: `YYYY-MM-DDTHH:MM:SS`)
+The `run_config.json` file in the output directory stores the original parameters, and `download_progress.json` tracks which stations have already been completed.
 
-### Optional Arguments
-- `--networks`: Network codes (e.g., `UW CC CN`)
-- `--phases`: Phase types (default: `P S`)
-- `--min-score`: Minimum pick score (default: 0.3)
-- `--max-score`: Maximum pick score (default: 1.0)
-- `--channels`: Channel filter (default: `HH?,EH?,BH?`)
-- `--output-dir`: Output directory (default: `./quakescope_output`)
-- `--fdsn-client`: FDSN client (default: `IRIS`)
-- `--no-organize-by-day`: Save all picks in one file instead of per station/day
+## Examples
 
-### Examples
-
-**Pacific Northwest - UW network:**
-```bash
-python workflow.py \
-    --minlat 46 --maxlat 49 --minlon -125 --maxlon -120 \
-    --networks UW \
-    --start 2024-01-01T00:00:00 --end 2024-01-02T00:00:00
+**Pacific Northwest - UW network** (`config.yaml`):
+```yaml
+minlat: 46.0
+maxlat: 49.0
+minlon: -125.0
+maxlon: -120.0
+start: "2024-01-01T00:00:00"
+end:   "2024-01-02T00:00:00"
+networks: [UW]
+min_score: 0.3
 ```
 
 **California - Multiple networks:**
-```bash
-python workflow.py \
-    --minlat 34 --maxlat 37 --minlon -120 --maxlon -116 \
-    --networks CI NC \
-    --start 2024-01-01T00:00:00 --end 2024-01-01T12:00:00 \
-    --min-score 0.5
+```yaml
+minlat: 34.0
+maxlat: 37.0
+minlon: -120.0
+maxlon: -116.0
+start: "2024-01-01T00:00:00"
+end:   "2024-01-01T12:00:00"
+networks: [CI, NC]
+min_score: 0.5
 ```
 
 **High quality picks only:**
-```bash
-python workflow.py \
-    --minlat 40 --maxlat 42 --minlon -122 --maxlon -120 \
-    --networks NC \
-    --start 2024-01-01T00:00:00 --end 2024-01-03T00:00:00 \
-    --min-score 0.7 \
-    --channels HH?
+```yaml
+minlat: 40.0
+maxlat: 42.0
+minlon: -122.0
+maxlon: -120.0
+start: "2024-01-01T00:00:00"
+end:   "2024-01-03T00:00:00"
+networks: [NC]
+channels: "HH?"
+min_score: 0.7
+output_format: "parquet"
 ```
 
 ## Python API
@@ -208,11 +271,11 @@ Column mapping to PyOcto format:
 Required columns for PyOcto (plus amplitude for reference):
 ```python
 {
-    'station': str,      # Station identifier  
-    'time': float,       # Unix timestamp (seconds)
-    'phase': str,        # 'P' or 'S' (uppercase)
-    'probability': float,# Confidence (0-1)
-    'amplitude': float   # Pick amplitude (optional, for reference)
+    'station': str,       # Station identifier
+    'time': float,        # Unix timestamp (seconds)
+    'phase': str,         # 'P' or 'S' (uppercase)
+    'probability': float, # Confidence (0-1)
+    'amplitude': float    # Pick amplitude (optional, for reference)
 }
 ```
 
@@ -220,7 +283,7 @@ Required columns for PyOcto (plus amplitude for reference):
 Required columns for PyOcto:
 ```python
 {
-    'station': str,  # Station identifier  
+    'station': str,  # Station identifier
     'x': float,      # X coordinate (km, properly projected)
     'y': float,      # Y coordinate (km, properly projected)
     'z': float       # Z coordinate (km, negative for elevation)
@@ -240,7 +303,7 @@ Required columns for PyOcto:
 **Hit QuakeScope limit (10,000 picks):**
 - Use shorter time windows
 - Filter by channel type
-- Increase min_score to reduce picks
+- Increase `min_score` to reduce picks
 
 **PyOcto not installed:**
 - The script will fall back to simple approximation
@@ -267,4 +330,4 @@ MIT
 
 ## Author
 
-Grant - 2025-01-29
+Grant Clark - 2025-01-29
