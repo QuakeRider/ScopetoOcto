@@ -476,37 +476,266 @@ class QuakeScopePicksDownloader:
         - trace_id, network_code, station_code, location_code, channel
         - start_time, peak_time, end_time
         - confidence, amplitude, phase
-        
+
         Parameters:
         -----------
         picks_df : pd.DataFrame
             Raw picks from QuakeScope
-            
+
         Returns:
         --------
         pd.DataFrame
-            Picks in PyOcto format plus amplitude
+            Picks in PyOcto format with columns:
+            station, time, phase, probability, amplitude, channel, location_code
+            - station: full trace ID (NET.STA.LOC) kept here; normalized to
+              NET.STA. after cross-location deduplication.
+            - channel: 2-letter channel prefix (e.g. 'HH', 'BH') for dedup.
+            - location_code: original location code (e.g. '00', '60') for dedup.
         """
         if picks_df.empty:
-            return pd.DataFrame(columns=['station', 'time', 'phase', 'probability', 'amplitude'])
-        
-        # Use trace_id as station identifier
+            return pd.DataFrame(columns=[
+                'station', 'time', 'phase', 'probability', 'amplitude',
+                'channel', 'location_code',
+            ])
+
+        # Derive 2-letter channel prefix; fall back gracefully if column absent.
+        if 'channel' in picks_df.columns:
+            channel_prefix = picks_df['channel'].astype(str).str[:2]
+        else:
+            channel_prefix = pd.Series([''] * len(picks_df), index=picks_df.index)
+
+        loc_col = picks_df['location_code'] if 'location_code' in picks_df.columns \
+            else pd.Series([''] * len(picks_df), index=picks_df.index)
+
         pyocto_picks = pd.DataFrame({
             'station': picks_df['trace_id'],
-            'time': pd.to_datetime(picks_df['peak_time']).astype(np.int64) / 1e9,  # Convert to Unix timestamp
-            'phase': picks_df['phase'].str.upper(),  # Ensure uppercase P/S
-            'probability': picks_df['confidence'],  # Pick confidence score
-            'amplitude': picks_df['amplitude']  # Keep amplitude for reference
+            'time': pd.to_datetime(picks_df['peak_time']).astype(np.int64) / 1e9,
+            'phase': picks_df['phase'].str.upper(),
+            'probability': picks_df['confidence'],
+            'amplitude': picks_df['amplitude'],
+            'channel': channel_prefix,
+            'location_code': loc_col.fillna(''),
         })
-        
-        # Remove any NaN values in required columns
+
         pyocto_picks = pyocto_picks.dropna(subset=['station', 'time', 'phase', 'probability'])
-        
-        # Sort by time for efficiency
         pyocto_picks = pyocto_picks.sort_values('time').reset_index(drop=True)
-        
+
         return pyocto_picks
     
+    # Default channel priority: lower index = higher preference.
+    # Covers every channel type present in the QuakeScope database.
+    DEFAULT_CHANNEL_PRIORITY: List[str] = [
+        'HH', 'BH', 'EH', 'SH', 'HN', 'CN', 'EL', 'SL', 'EP', 'DP',
+    ]
+
+    def deduplicate_picks_cross_location(
+        self,
+        picks_df: pd.DataFrame,
+        time_threshold: float = 0.5,
+        channel_priority: Optional[List[str]] = None,
+    ) -> pd.DataFrame:
+        """
+        Merge picks from multiple location codes at the same physical station
+        and remove duplicates using a channel-type hierarchy.
+
+        Algorithm
+        ---------
+        For each phase type separately:
+          1. Sort picks by time.
+          2. Assign a sequential group ID that increments whenever the gap
+             between consecutive picks exceeds *time_threshold* seconds.
+             (Picks within the same group arrived too close together to be
+             from distinct events, so only one should be kept.)
+          3. Within each group keep the pick with the highest channel priority.
+             Picks that form a group of one (no near neighbour on any other
+             location code) are always kept regardless of priority.
+        Finally normalise the ``station`` field to ``NET.STA.`` (empty
+        location code) so the merged file matches the single PyOcto station
+        entry for the physical site.
+
+        Parameters
+        ----------
+        picks_df : pd.DataFrame
+            Formatted picks (from format_for_pyocto) for *one physical station*
+            covering potentially several location codes.  Must contain columns:
+            station, time, phase, probability, amplitude, channel, location_code.
+        time_threshold : float
+            Maximum separation in seconds between two picks that are considered
+            duplicates of the same arrival.  Default 0.5 s.
+        channel_priority : list of str, optional
+            Ordered list of 2-letter channel prefixes, best first.
+            Defaults to DEFAULT_CHANNEL_PRIORITY.
+
+        Returns
+        -------
+        pd.DataFrame
+            Deduplicated picks with ``station`` normalised to ``NET.STA.``.
+        """
+        if picks_df.empty:
+            return picks_df.copy()
+
+        if channel_priority is None:
+            channel_priority = self.DEFAULT_CHANNEL_PRIORITY
+
+        priority_map = {ch: i for i, ch in enumerate(channel_priority)}
+        n_fallback = len(channel_priority)  # rank for unknown channel types
+
+        picks_df = picks_df.copy()
+        picks_df['_priority'] = (
+            picks_df['channel']
+            .map(priority_map)
+            .fillna(n_fallback)
+            .astype(int)
+        )
+
+        result_pieces = []
+
+        for phase, phase_picks in picks_df.groupby('phase'):
+            phase_picks = phase_picks.sort_values('time').reset_index(drop=True)
+            times = phase_picks['time'].to_numpy()
+
+            # Assign group IDs: new group whenever gap > threshold.
+            group_ids = np.zeros(len(times), dtype=int)
+            for i in range(1, len(times)):
+                group_ids[i] = group_ids[i - 1] + (
+                    1 if (times[i] - times[i - 1]) > time_threshold else 0
+                )
+            phase_picks['_group'] = group_ids
+
+            # Within each group keep the pick with the lowest priority number
+            # (= highest channel quality).
+            kept_idx = phase_picks.groupby('_group')['_priority'].idxmin()
+            result_pieces.append(phase_picks.loc[kept_idx])
+
+        if not result_pieces:
+            return pd.DataFrame(columns=picks_df.columns)
+
+        deduped = pd.concat(result_pieces, ignore_index=True)
+        deduped = deduped.drop(columns=['_priority', '_group'])
+
+        # Normalise station to NET.STA. (physical station id, empty location).
+        # The location code and channel are preserved in their own columns.
+        deduped['station'] = deduped['station'].apply(
+            lambda s: '.'.join(s.split('.')[:2]) + '.'
+        )
+
+        return deduped.sort_values('time').reset_index(drop=True)
+
+    def merge_and_deduplicate_station_day_files(
+        self,
+        stations_df: pd.DataFrame,
+        time_threshold: float = 0.5,
+        channel_priority: Optional[List[str]] = None,
+    ) -> int:
+        """
+        Post-processing pass: merge per-location-code pick files into one
+        deduplicated file per physical station per day, then remove the
+        per-location source files.
+
+        This is called automatically by run() after all downloads finish.
+        For each calendar-day directory under self.output_dir the method:
+          1. Groups pick files that belong to the same physical station
+             (identified by ``physical_station`` in *stations_df*).
+          2. Loads, merges, and deduplicates them with
+             deduplicate_picks_cross_location().
+          3. Writes a single ``NET_STA__picks.csv`` (double underscore =
+             empty location code) per physical station per day.
+          4. Deletes the per-location-code source files.
+
+        Parameters
+        ----------
+        stations_df : pd.DataFrame
+            Station metadata (output of get_stations_with_metadata).
+            Must contain ``tid`` and ``physical_station`` columns.
+        time_threshold : float
+            Passed to deduplicate_picks_cross_location().
+        channel_priority : list of str, optional
+            Passed to deduplicate_picks_cross_location().
+
+        Returns
+        -------
+        int
+            Number of merged station-day files written.
+        """
+        if 'physical_station' not in stations_df.columns:
+            print("WARNING: stations_df missing 'physical_station' column; "
+                  "skipping merge/dedup pass.")
+            return 0
+
+        # Build a mapping from per-location filename stem → physical station id.
+        # File names are like  IU_CCM_60_picks.csv  (tid with dots→underscores).
+        tid_to_phys: dict = {}
+        for _, row in stations_df.iterrows():
+            tid_clean = row['tid'].replace('.', '_')
+            tid_to_phys[tid_clean] = row['physical_station']
+
+        merged_count = 0
+
+        # Walk each day directory.
+        for day_dir in sorted(self.output_dir.iterdir()):
+            if not day_dir.is_dir():
+                continue
+
+            # Group pick files by physical station.
+            phys_groups: dict = {}  # physical_station → list of Path
+            for fpath in day_dir.glob('*_picks.csv'):
+                stem = fpath.stem.replace('_picks', '')  # e.g. IU_CCM_60
+                phys = tid_to_phys.get(stem)
+                if phys is None:
+                    # File may already be a merged file (IU_CCM_) — skip.
+                    continue
+                phys_groups.setdefault(phys, []).append(fpath)
+
+            for phys_sta, fpaths in phys_groups.items():
+                if not fpaths:
+                    continue
+
+                # Load and merge all location-code files for this station-day.
+                dfs = []
+                for fp in fpaths:
+                    try:
+                        df = pd.read_csv(fp)
+                        if not df.empty:
+                            dfs.append(df)
+                    except Exception as e:
+                        print(f"  WARNING: could not read {fp}: {e}")
+
+                if not dfs:
+                    for fp in fpaths:
+                        fp.unlink(missing_ok=True)
+                    continue
+
+                merged = pd.concat(dfs, ignore_index=True)
+                deduped = self.deduplicate_picks_cross_location(
+                    merged, time_threshold=time_threshold,
+                    channel_priority=channel_priority,
+                )
+
+                # Write merged file: NET_STA__picks.csv (double underscore =
+                # empty location code, mirrors tid format NET.STA.)
+                phys_clean = phys_sta.replace('.', '_')
+                out_path = day_dir / f"{phys_clean}__picks.csv"
+
+                n_src = len(merged)
+                deduped.to_csv(out_path, index=False)
+
+                print(f"  {day_dir.name}/{out_path.name}: "
+                      f"{n_src} picks → {len(deduped)} after dedup "
+                      f"({len(fpaths)} location file(s) merged)")
+
+                # Delete per-location source files.  Skip the output file
+                # itself in the (rare) case where a station with an empty
+                # location code produced a source filename identical to the
+                # merged output filename.
+                for fp in fpaths:
+                    if fp.resolve() != out_path.resolve():
+                        fp.unlink(missing_ok=True)
+
+                merged_count += 1
+
+        print(f"\nMerge/dedup complete: {merged_count} station-day file(s) written.")
+        return merged_count
+
     def organize_by_station_day(self, picks_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """
         Organize picks into separate DataFrames per station per day.
@@ -605,7 +834,7 @@ class QuakeScopePicksDownloader:
         print(f"Saved {len(picks_df)} picks to {filepath}")
         return filepath
     
-    def run(self, 
+    def run(self,
             stations_df: pd.DataFrame,
             start_time: str,
             end_time: str,
@@ -614,14 +843,31 @@ class QuakeScopePicksDownloader:
             max_score: float = 1.0,
             channel: Optional[str] = None,
             organize_by_day: bool = True,
-            output_format: str = 'csv') -> List[Path]:
+            output_format: str = 'csv',
+            dedup_time_threshold: float = 0.5,
+            channel_priority: Optional[List[str]] = None) -> List[Path]:
         """
-        Complete workflow: download, format, organize, and save picks.
-        
+        Complete workflow: download, format, organize, deduplicate, and save picks.
+
+        When *organize_by_day* is True (the default) the workflow is:
+          1. Download picks per station/location-code tid, writing one
+             ``NET_STA_LOC_picks.csv`` file per tid per day as each day
+             arrives (no large in-memory accumulation).
+          2. After all downloads finish, run a merge/dedup pass that groups
+             the per-location files by physical station (NET.STA), deduplicates
+             cross-location picks using *channel_priority* and
+             *dedup_time_threshold*, and writes a single merged
+             ``NET_STA__picks.csv`` per physical station per day.  The
+             per-location source files are then removed so the output
+             directory is clean.
+
         Parameters:
         -----------
         stations_df : pd.DataFrame
-            Station metadata with columns: tid, start_date, end_date
+            Station metadata with columns: tid, start_date, end_date.
+            If it also contains ``physical_station`` (produced by
+            get_stations_with_metadata) the merge/dedup pass runs
+            automatically; otherwise it is skipped.
         start_time : str
             Start time (ISO format)
         end_time : str
@@ -633,15 +879,24 @@ class QuakeScopePicksDownloader:
         channel : str, optional
             Channel filter
         organize_by_day : bool
-            If True, organize into separate files per station/day.
-            If False, save all picks in one file.
+            If True, organize into separate files per station/day and run
+            the cross-location dedup pass.
+            If False, save all picks in one combined file (no dedup).
         output_format : str
             Output format ('csv', 'parquet', 'pickle')
-            
+        dedup_time_threshold : float
+            Time window in seconds for cross-location duplicate detection.
+            Default 0.5 s.  Only used when organize_by_day=True and
+            stations_df contains 'physical_station'.
+        channel_priority : list of str, optional
+            Ordered 2-letter channel prefixes, best first.  Defaults to
+            DEFAULT_CHANNEL_PRIORITY.  Only used during dedup.
+
         Returns:
         --------
         list of Path
-            List of saved file paths
+            List of saved file paths (merged station-day files when dedup
+            runs, otherwise per-tid files or a single combined file).
         """
         # Track files written during this run (populated by download_picks_for_station
         # when write_immediately=True)
@@ -666,14 +921,32 @@ class QuakeScopePicksDownloader:
         )
 
         if organize_by_day:
-            # Files were already written per day; skip the redundant
-            # format → organize → save pipeline
             if not self._immediate_files:
                 print("No picks found for given criteria")
                 return []
-            print(f"Organized into {len(self._immediate_files)} station-day files")
-            print(f"\nSaved {len(self._immediate_files)} pick files to {self.output_dir}")
-            return self._immediate_files
+
+            print(f"Downloaded {len(self._immediate_files)} station-day file(s) "
+                  f"across all location codes")
+
+            # Cross-location dedup pass — runs only when stations_df has the
+            # 'physical_station' column produced by get_stations_with_metadata.
+            if 'physical_station' in stations_df.columns:
+                print(f"\nRunning cross-location dedup "
+                      f"(threshold={dedup_time_threshold}s)...")
+                self.merge_and_deduplicate_station_day_files(
+                    stations_df=stations_df,
+                    time_threshold=dedup_time_threshold,
+                    channel_priority=channel_priority,
+                )
+                # Return the merged output files that now exist on disk.
+                merged_files = sorted(self.output_dir.rglob('*__picks.csv'))
+                print(f"\nSaved {len(merged_files)} merged station-day file(s) "
+                      f"to {self.output_dir}")
+                return merged_files
+            else:
+                print(f"\nSaved {len(self._immediate_files)} pick file(s) to "
+                      f"{self.output_dir}")
+                return self._immediate_files
 
         # organize_by_day=False: save all picks in a single combined file
         if raw_picks.empty:
