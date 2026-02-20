@@ -567,7 +567,7 @@ class QuakeScopePicksDownloader:
 
         pyocto_picks = pd.DataFrame({
             'station': picks_df['trace_id'],
-            'time': pd.to_datetime(picks_df['peak_time']).astype(np.int64) / 1e9,
+            'time': pd.to_datetime(picks_df['peak_time'], format='mixed').astype(np.int64) / 1e9,
             'phase': picks_df['phase'].str.upper(),
             'probability': picks_df['confidence'],
             'amplitude': picks_df['amplitude'],
