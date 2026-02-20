@@ -207,8 +207,6 @@ def get_stations_with_metadata(
             # For stations with multiple location codes, this picks one arbitrarily
             # which is fine since we're just using it as a station identifier
             tid = f"{net_code}.{sta_code}.{loc_code if loc_code else ''}"
-            if not tid.endswith('.'):
-                tid += '.'
             
             stations_data.append({
                 'network': net_code,
