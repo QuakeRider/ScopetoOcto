@@ -45,6 +45,47 @@ class QuakeScopePicksDownloader:
 
         # Maximum picks per query (QuakeScope limit)
         self.max_limit = 10000
+
+    def create_day_directories(self, start_time: str, end_time: str) -> List[Path]:
+        """
+        Pre-create one subdirectory per calendar day for the full timeframe.
+
+        Directories are created immediately so they exist before any downloads
+        begin.  Days that end up having no picks will simply remain empty.
+
+        Parameters:
+        -----------
+        start_time : str
+            Start of the timeframe (ISO format: YYYY-MM-DDTHH:MM:SS)
+        end_time : str
+            End of the timeframe (ISO format: YYYY-MM-DDTHH:MM:SS)
+
+        Returns:
+        --------
+        list of Path
+            Sorted list of day directory paths that were created.
+        """
+        from datetime import datetime, timedelta
+
+        def _parse_naive_utc(s):
+            return datetime.fromisoformat(s.replace('Z', '+00:00')).replace(tzinfo=None)
+
+        start_dt = _parse_naive_utc(start_time)
+        end_dt = _parse_naive_utc(end_time)
+
+        day_dirs = []
+        current = start_dt.date()
+        end_date = end_dt.date()
+
+        while current <= end_date:
+            day_dir = self.output_dir / str(current)
+            day_dir.mkdir(parents=True, exist_ok=True)
+            day_dirs.append(day_dir)
+            current += timedelta(days=1)
+
+        print(f"Created {len(day_dirs)} day director{'y' if len(day_dirs) == 1 else 'ies'} "
+              f"under {self.output_dir}")
+        return day_dirs
     
     def get_active_days_for_station(self,
                                     tid: str,
@@ -294,12 +335,13 @@ class QuakeScopePicksDownloader:
                 day_df = pd.concat(day_picks, ignore_index=True)
                 formatted_day = self.format_for_pyocto(day_df)
                 if not formatted_day.empty:
-                    # Derive a clean station name from the picks data itself so
-                    # the filename matches what organize_by_station_day() would use
+                    # Derive a clean station name from the picks data itself
                     station_name = formatted_day['station'].iloc[0]
                     station_clean = station_name.replace('.', '_').replace(' ', '_')
-                    key = f"{station_clean}_{active_date}"
-                    filepath = self.output_dir / f"{key}_picks.csv"
+                    # Place the file inside the pre-created date subdirectory
+                    day_dir = self.output_dir / str(active_date)
+                    day_dir.mkdir(parents=True, exist_ok=True)
+                    filepath = day_dir / f"{station_clean}_picks.csv"
                     # If a file already exists for this station-day (e.g. from a
                     # previous partial run), append and re-sort rather than clobber
                     if filepath.exists():
@@ -308,7 +350,7 @@ class QuakeScopePicksDownloader:
                             [existing, formatted_day], ignore_index=True
                         ).sort_values('time').reset_index(drop=True)
                     formatted_day.to_csv(filepath, index=False)
-                    print(f"  Wrote {len(formatted_day)} picks → {filepath.name}")
+                    print(f"  Wrote {len(formatted_day)} picks → {active_date}/{filepath.name}")
                     if hasattr(self, '_immediate_files'):
                         self._immediate_files.append(filepath)
 
@@ -515,23 +557,31 @@ class QuakeScopePicksDownloader:
             List of saved file paths
         """
         saved_files = []
-        
+
         for key, df in organized_picks.items():
+            # Key format: "{station_clean}_{YYYY-MM-DD}"
+            # Extract the trailing date (always 10 chars: YYYY-MM-DD) to build
+            # the date subdirectory, leaving the station name for the filename.
+            date_str = key[-10:]
+            station_part = key[:-11]  # strip "_{date}"
+            day_dir = self.output_dir / date_str
+            day_dir.mkdir(parents=True, exist_ok=True)
+
             if format == 'csv':
-                filepath = self.output_dir / f"{key}_picks.csv"
+                filepath = day_dir / f"{station_part}_picks.csv"
                 df.to_csv(filepath, index=False)
             elif format == 'parquet':
-                filepath = self.output_dir / f"{key}_picks.parquet"
+                filepath = day_dir / f"{station_part}_picks.parquet"
                 df.to_parquet(filepath, index=False)
             elif format == 'pickle':
-                filepath = self.output_dir / f"{key}_picks.pkl"
+                filepath = day_dir / f"{station_part}_picks.pkl"
                 df.to_pickle(filepath)
             else:
                 raise ValueError(f"Unknown format: {format}")
-            
+
             saved_files.append(filepath)
         
-        print(f"\nSaved {len(saved_files)} pick files to {self.output_dir}")
+        print(f"\nSaved {len(saved_files)} pick files to {self.output_dir} (organised by date)")
         return saved_files
     
     def save_combined(self, picks_df: pd.DataFrame, filename: str = "all_picks.csv") -> Path:
@@ -596,6 +646,11 @@ class QuakeScopePicksDownloader:
         # Track files written during this run (populated by download_picks_for_station
         # when write_immediately=True)
         self._immediate_files = []
+
+        # Pre-create one subdirectory per calendar day so the directory tree is
+        # fully visible before any downloads begin.  Empty day directories (no
+        # picks) are left in place; they cause no harm and are informative.
+        self.create_day_directories(start_time, end_time)
 
         # Download — when organize_by_day is True each day's picks are written
         # to disk as soon as they arrive, so nothing is held in memory until the end
