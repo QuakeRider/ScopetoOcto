@@ -11,7 +11,7 @@ Date: 2025-01-29
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import requests
@@ -45,6 +45,60 @@ class QuakeScopePicksDownloader:
         # Maximum picks per query (QuakeScope limit)
         self.max_limit = 10000
     
+    def get_active_days_for_station(self,
+                                    tid: str,
+                                    start_dt: datetime,
+                                    end_dt: datetime) -> List[date]:
+        """
+        Discover which days within a timeframe actually have picks for a station.
+
+        Makes a single full-timeframe request (without phase/channel/score filters)
+        and parses the response to extract the unique dates that contain picks.
+        This avoids issuing per-day requests for days with no data.
+
+        Parameters:
+        -----------
+        tid : str
+            Trace ID (format: "NET.STA.LOC" or "NET.STA.")
+        start_dt : datetime
+            Start of the timeframe (naive UTC)
+        end_dt : datetime
+            End of the timeframe (naive UTC)
+
+        Returns:
+        --------
+        list of datetime.date
+            Sorted list of dates that have at least one pick.
+            Returns an empty list if no picks exist or the request fails.
+        """
+        params = {
+            'tid': tid,
+            'start_time': start_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+            'end_time': end_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+            'limit': self.max_limit
+        }
+
+        try:
+            response = requests.get(self.picks_url, params=params, timeout=30)
+            response.raise_for_status()
+
+            if response.text.strip():
+                df = pd.read_csv(StringIO(response.text), delimiter='|')
+                if not df.empty and 'peak_time' in df.columns:
+                    if len(df) >= self.max_limit:
+                        print(f"  NOTE: Overview request hit limit ({self.max_limit}) for {tid}; "
+                              f"some active days may be missed in the pre-filter step")
+                    dates = sorted(pd.to_datetime(df['peak_time']).dt.date.unique())
+                    return dates
+
+        except requests.RequestException as e:
+            print(f"  WARNING: Could not fetch overview for {tid}: {e}. "
+                  f"Falling back to querying all days.")
+        except pd.errors.EmptyDataError:
+            pass
+
+        return []
+
     def download_picks_for_station(self,
                                    tid: str,
                                    start_time: str,
@@ -57,9 +111,12 @@ class QuakeScopePicksDownloader:
                                    channel: Optional[str] = None) -> pd.DataFrame:
         """
         Download picks for a single station from QuakeScope.
-        
-        Queries are chunked by day to avoid hitting the 10,000 pick limit.
-        Only queries days when the station was active.
+
+        First makes a single full-range overview request to discover which days
+        have picks (see get_active_days_for_station).  Only those days are then
+        queried in detail, chunked by day to stay within the 10,000-pick limit.
+        Days with no picks and days outside the station's operational window are
+        skipped entirely.
         
         Parameters:
         -----------
@@ -114,20 +171,36 @@ class QuakeScopePicksDownloader:
         if start_dt >= end_dt:
             return pd.DataFrame()
         
+        # Discover which days actually have picks before issuing per-day requests.
+        # A single full-range overview request is made (no phase/channel/score filters)
+        # so we can skip days that are empty and avoid unnecessary API calls.
+        n_total_days = max((end_dt - start_dt).days, 1)
+        active_days = self.get_active_days_for_station(tid, start_dt, end_dt)
+        time.sleep(0.05)  # Be nice to the server after the overview request
+
+        if not active_days:
+            return pd.DataFrame()
+
+        print(f"  Active days with picks: {len(active_days)}/{n_total_days} "
+              f"(skipping {n_total_days - len(active_days)} empty day(s))")
+
         all_picks = []
-        
-        # Chunk by day
-        current_dt = start_dt
-        while current_dt < end_dt:
-            next_dt = min(current_dt + timedelta(days=1), end_dt)
-            
-            # Format times for this chunk
-            chunk_start = current_dt.strftime('%Y-%m-%dT%H:%M:%S')
-            chunk_end = next_dt.strftime('%Y-%m-%dT%H:%M:%S')
-            
+
+        # Only iterate over days that are known to have picks
+        for active_date in active_days:
+            day_start = datetime(active_date.year, active_date.month, active_date.day)
+            day_end = day_start + timedelta(days=1)
+
+            # Clamp to the requested range (handles partial first/last days)
+            chunk_start_dt = max(day_start, start_dt)
+            chunk_end_dt = min(day_end, end_dt)
+
+            chunk_start = chunk_start_dt.strftime('%Y-%m-%dT%H:%M:%S')
+            chunk_end = chunk_end_dt.strftime('%Y-%m-%dT%H:%M:%S')
+
             # If phases specified, query each phase separately
             phase_list = phases if phases else [None]
-            
+
             for phase in phase_list:
                 params = {
                     'tid': tid,
@@ -137,37 +210,35 @@ class QuakeScopePicksDownloader:
                     'max_score': max_score,
                     'limit': self.max_limit
                 }
-                
+
                 if phase:
                     params['phase'] = phase
                 if channel:
                     params['channel'] = channel
-                
+
                 try:
                     response = requests.get(self.picks_url, params=params, timeout=30)
                     response.raise_for_status()
-                    
+
                     # Parse pipe-delimited CSV
                     if response.text.strip():
                         df = pd.read_csv(StringIO(response.text), delimiter='|')
                         if not df.empty:
                             all_picks.append(df)
-                        
+
                         # Warn if we hit the limit even with daily chunks
                         if len(df) >= self.max_limit:
-                            print(f"  WARNING: Hit limit ({self.max_limit}) for {tid} on {current_dt.date()}, phase={phase}")
-                    
+                            print(f"  WARNING: Hit limit ({self.max_limit}) for {tid} on {active_date}, phase={phase}")
+
                 except requests.RequestException as e:
-                    print(f"  ERROR downloading {tid} on {current_dt.date()}, phase={phase}: {e}")
+                    print(f"  ERROR downloading {tid} on {active_date}, phase={phase}: {e}")
                 except pd.errors.EmptyDataError:
                     # No data for this query
                     pass
-                
+
                 # Be nice to the server
                 time.sleep(0.05)
-            
-            current_dt = next_dt
-        
+
         if all_picks:
             return pd.concat(all_picks, ignore_index=True)
         else:
@@ -183,9 +254,13 @@ class QuakeScopePicksDownloader:
                            channel: Optional[str] = None) -> pd.DataFrame:
         """
         Download picks for multiple stations.
-        
-        Queries are automatically chunked by day to avoid hitting limits.
-        Only queries days when each station was operational.
+
+        For each station an overview request is first made covering the full
+        timeframe to discover which days actually have picks.  Only those days
+        are then queried in detail (per-day, per-phase), skipping days with no
+        data.  This avoids issuing unnecessary requests when picks are sparse
+        across the requested range.  Station operational periods are also
+        respected so no requests are made outside the station's active window.
         
         Parameters:
         -----------
@@ -218,7 +293,8 @@ class QuakeScopePicksDownloader:
         print(f"Requested time range: {start_time} to {end_time} ({n_days} days)")
         print(f"Phases: {phases if phases else 'all'}")
         print(f"Score range: {min_score} to {max_score}")
-        print(f"NOTE: Queries are chunked by day and limited to each station's operational period")
+        print(f"NOTE: An overview request is made per station to find days with picks; "
+              f"only those days are then queried in detail")
         
         all_picks = []
         
