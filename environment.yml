@@ -10,5 +10,6 @@ dependencies:
   - requests
   - tqdm
   - pip
+  - pyyaml
   - pip:
     - pyocto

@@ -10,6 +10,10 @@ Steps:
 3. Formats picks for PyOcto
 4. Saves picks organized by station/day
 
+Usage:
+  python workflow.py --config config.yaml
+  python workflow.py --resume ./quakescope_output
+
 Author: Grant
 Date: 2025-01-29
 """
@@ -20,11 +24,50 @@ from pathlib import Path
 import argparse
 
 import pandas as pd
+import yaml
 
 # Import our helper modules
 from get_stations import get_stations_in_bounds, get_stations_with_metadata, create_pyocto_stations_df
 from quakescope_to_pyocto import QuakeScopePicksDownloader
 
+
+# ---------------------------------------------------------------------------
+# YAML config helpers
+# ---------------------------------------------------------------------------
+
+def load_yaml_config(config_path: str) -> dict:
+    """Load and return a YAML configuration file.
+
+    Raises ``FileNotFoundError`` if the file does not exist and
+    ``ValueError`` if the file cannot be parsed as YAML.
+    """
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    try:
+        with open(path) as f:
+            config = yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Could not parse config file {config_path}: {e}")
+    if config is None:
+        config = {}
+    return config
+
+
+def _validate_yaml_config(config: dict) -> None:
+    """Raise ``ValueError`` for any missing required fields."""
+    required = ['minlat', 'maxlat', 'minlon', 'maxlon', 'start', 'end']
+    missing = [k for k in required if config.get(k) is None]
+    if missing:
+        raise ValueError(
+            f"The following required fields are missing from the config file: "
+            f"{', '.join(missing)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Run-config persistence (enables --resume)
+# ---------------------------------------------------------------------------
 
 def save_run_config(output_dir: Path, config: dict) -> Path:
     """Save run parameters to ``run_config.json`` inside *output_dir*.
@@ -57,6 +100,10 @@ def load_run_config(output_dir: Path) -> dict:
         return json.load(f)
 
 
+# ---------------------------------------------------------------------------
+# Core workflow
+# ---------------------------------------------------------------------------
+
 def download_and_format_picks(
     minlat: float,
     maxlat: float,
@@ -72,11 +119,15 @@ def download_and_format_picks(
     output_dir: str = './quakescope_output',
     fdsn_client: str = 'IRIS',
     organize_by_day: bool = True,
+    output_format: str = 'csv',
+    dedup_time_threshold: float = 0.5,
+    channel_priority: list = None,
+    use_pyocto_projection: bool = True,
     resume: bool = False,
 ):
     """
     Download picks from QuakeScope and format for PyOcto.
-    
+
     Parameters:
     -----------
     minlat, maxlat : float
@@ -94,13 +145,27 @@ def download_and_format_picks(
     min_score, max_score : float
         Pick score range
     channel_filter : str
-        Channel codes for station query
+        Channel codes for station query (FDSN wildcards allowed)
     output_dir : str
         Output directory
     fdsn_client : str
         FDSN client name
     organize_by_day : bool
-        Whether to organize picks by station/day
+        When True, write one file per station per day and run the
+        cross-location deduplication pass.  When False, save all picks
+        in a single combined file with no deduplication.
+    output_format : str
+        Output file format: 'csv', 'parquet', or 'pickle'.
+    dedup_time_threshold : float
+        Maximum time separation in seconds between picks from different
+        location codes to be considered duplicates.  Only used when
+        organize_by_day is True.
+    channel_priority : list of str, optional
+        Ordered 2-letter channel prefixes, best first.  None uses the
+        built-in default inside QuakeScopePicksDownloader.
+    use_pyocto_projection : bool
+        When True (recommended), use PyOcto's CRS projection for station
+        coordinates.  When False, fall back to a simple lat/lon approximation.
     resume : bool
         When True, load station metadata from the existing output directory
         and skip any stations that were already fully downloaded in a previous
@@ -156,6 +221,10 @@ def download_and_format_picks(
             'channels': channel_filter,
             'fdsn_client': fdsn_client,
             'organize_by_day': organize_by_day,
+            'output_format': output_format,
+            'dedup_time_threshold': dedup_time_threshold,
+            'channel_priority': channel_priority,
+            'use_pyocto_projection': use_pyocto_projection,
             'output_dir': str(output_path.absolute()),
         }
         save_run_config(output_path, config)
@@ -188,7 +257,9 @@ def download_and_format_picks(
         print(f"Saved station metadata to: {stations_file}")
 
         # Create PyOcto stations format with proper projection
-        pyocto_stations, crs = create_pyocto_stations_df(stations_df)
+        pyocto_stations, crs = create_pyocto_stations_df(
+            stations_df, use_pyocto_projection=use_pyocto_projection
+        )
         pyocto_stations_file = output_path / 'pyocto_stations.csv'
         pyocto_stations.to_csv(pyocto_stations_file, index=False)
         print(f"Saved PyOcto stations to: {pyocto_stations_file}")
@@ -235,10 +306,12 @@ def download_and_format_picks(
         max_score=max_score,
         channel=channel_query,
         organize_by_day=organize_by_day,
-        output_format='csv',
+        output_format=output_format,
+        dedup_time_threshold=dedup_time_threshold,
+        channel_priority=channel_priority,
         resume=resume,
     )
-    
+
     # Summary
     print(f"\n{'='*80}")
     print(" Download Complete!")
@@ -263,6 +336,10 @@ def download_and_format_picks(
     }
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
 def main():
     """Command-line interface."""
     parser = argparse.ArgumentParser(
@@ -270,21 +347,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Pacific Northwest (UW network)
-  python workflow.py --minlat 46 --maxlat 49 --minlon -125 --maxlon -120 \\
-      --networks UW --start 2024-01-01T00:00:00 --end 2024-01-02T00:00:00
-
-  # California (multiple networks)
-  python workflow.py --minlat 34 --maxlat 37 --minlon -120 --maxlon -116 \\
-      --networks CI NC --start 2024-01-01T00:00:00 --end 2024-01-01T12:00:00 \\
-      --min-score 0.5
+  # Fresh run — all parameters are set in the config file
+  python workflow.py --config config.yaml
 
   # Resume an interrupted download
   python workflow.py --resume ./quakescope_output
+
+See config.yaml for a fully annotated example of all available options.
         """
     )
 
-    # Resume mode — mutually exclusive with a fresh run's required arguments.
+    parser.add_argument(
+        '--config', metavar='CONFIG_FILE',
+        help=(
+            'Path to a YAML configuration file. Required for a fresh run. '
+            'See config.yaml for a documented example.'
+        )
+    )
     parser.add_argument(
         '--resume', metavar='OUTPUT_DIR',
         help=(
@@ -294,33 +373,13 @@ Examples:
         )
     )
 
-    # Required arguments (not needed when --resume is given)
-    parser.add_argument('--minlat', type=float, help='Minimum latitude')
-    parser.add_argument('--maxlat', type=float, help='Maximum latitude')
-    parser.add_argument('--minlon', type=float, help='Minimum longitude')
-    parser.add_argument('--maxlon', type=float, help='Maximum longitude')
-    parser.add_argument('--start', help='Start time (ISO format: YYYY-MM-DDTHH:MM:SS)')
-    parser.add_argument('--end', help='End time (ISO format: YYYY-MM-DDTHH:MM:SS)')
-
-    # Optional arguments
-    parser.add_argument('--networks', nargs='+',
-                       help='Network codes (e.g., UW CC CN)')
-    parser.add_argument('--phases', nargs='+', default=['P', 'S'],
-                       help='Phase types (default: P S)')
-    parser.add_argument('--min-score', type=float, default=0.3,
-                       help='Minimum pick score (default: 0.3)')
-    parser.add_argument('--max-score', type=float, default=1.0,
-                       help='Maximum pick score (default: 1.0)')
-    parser.add_argument('--channels', default='HH?,EH?,BH?',
-                       help='Channel filter (default: HH?,EH?,BH?)')
-    parser.add_argument('--output-dir', default='./quakescope_output',
-                       help='Output directory (default: ./quakescope_output)')
-    parser.add_argument('--fdsn-client', default='IRIS',
-                       help='FDSN client (default: IRIS)')
-    parser.add_argument('--no-organize-by-day', action='store_true',
-                       help='Do not organize picks by station/day')
-
     args = parser.parse_args()
+
+    if args.resume and args.config:
+        parser.error('--config and --resume are mutually exclusive.')
+
+    if not args.resume and not args.config:
+        parser.error('One of --config or --resume is required.')
 
     # ── Resume mode ────────────────────────────────────────────────────────
     if args.resume:
@@ -346,38 +405,43 @@ Examples:
             output_dir=str(resume_dir),
             fdsn_client=config.get('fdsn_client', 'IRIS'),
             organize_by_day=config.get('organize_by_day', True),
+            output_format=config.get('output_format', 'csv'),
+            dedup_time_threshold=config.get('dedup_time_threshold', 0.5),
+            channel_priority=config.get('channel_priority'),
+            use_pyocto_projection=config.get('use_pyocto_projection', True),
             resume=True,
         )
         if result is None:
             sys.exit(1)
         return
 
-    # ── Fresh run mode ─────────────────────────────────────────────────────
-    # Validate that the required positional arguments were provided.
-    missing = [f'--{f}' for f in ('minlat', 'maxlat', 'minlon', 'maxlon', 'start', 'end')
-               if getattr(args, f.replace('-', '_')) is None]
-    if missing:
-        parser.error(
-            f"the following arguments are required for a fresh run: "
-            f"{', '.join(missing)}\n"
-            f"(To resume an interrupted run, use --resume OUTPUT_DIR instead.)"
-        )
+    # ── Config (fresh run) mode ────────────────────────────────────────────
+    try:
+        config = load_yaml_config(args.config)
+        _validate_yaml_config(config)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
     result = download_and_format_picks(
-        minlat=args.minlat,
-        maxlat=args.maxlat,
-        minlon=args.minlon,
-        maxlon=args.maxlon,
-        start_time=args.start,
-        end_time=args.end,
-        networks=args.networks,
-        phases=args.phases,
-        min_score=args.min_score,
-        max_score=args.max_score,
-        channel_filter=args.channels,
-        output_dir=args.output_dir,
-        fdsn_client=args.fdsn_client,
-        organize_by_day=not args.no_organize_by_day,
+        minlat=config['minlat'],
+        maxlat=config['maxlat'],
+        minlon=config['minlon'],
+        maxlon=config['maxlon'],
+        start_time=config['start'],
+        end_time=config['end'],
+        networks=config.get('networks'),
+        phases=config.get('phases', ['P', 'S']),
+        min_score=config.get('min_score', 0.3),
+        max_score=config.get('max_score', 1.0),
+        channel_filter=config.get('channels', 'HH?,EH?,BH?'),
+        output_dir=config.get('output_dir', './quakescope_output'),
+        fdsn_client=config.get('fdsn_client', 'IRIS'),
+        organize_by_day=config.get('organize_by_day', True),
+        output_format=config.get('output_format', 'csv'),
+        dedup_time_threshold=config.get('dedup_time_threshold', 0.5),
+        channel_priority=config.get('channel_priority'),
+        use_pyocto_projection=config.get('use_pyocto_projection', True),
         resume=False,
     )
 
