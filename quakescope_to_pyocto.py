@@ -298,8 +298,10 @@ class QuakeScopePicksDownloader:
                     # the filename matches what organize_by_station_day() would use
                     station_name = formatted_day['station'].iloc[0]
                     station_clean = station_name.replace('.', '_').replace(' ', '_')
-                    key = f"{station_clean}_{active_date}"
-                    filepath = self.output_dir / f"{key}_picks.csv"
+                    # Output: picks/{YYYY-MM-DD}/{station}_picks.csv
+                    day_dir = self.output_dir / str(active_date)
+                    day_dir.mkdir(parents=True, exist_ok=True)
+                    filepath = day_dir / f"{station_clean}_picks.csv"
                     # If a file already exists for this station-day (e.g. from a
                     # previous partial run), append and re-sort rather than clobber
                     if filepath.exists():
@@ -308,7 +310,7 @@ class QuakeScopePicksDownloader:
                             [existing, formatted_day], ignore_index=True
                         ).sort_values('time').reset_index(drop=True)
                     formatted_day.to_csv(filepath, index=False)
-                    print(f"  Wrote {len(formatted_day)} picks → {filepath.name}")
+                    print(f"  Wrote {len(formatted_day)} picks → {active_date}/{filepath.name}")
                     if hasattr(self, '_immediate_files'):
                         self._immediate_files.append(filepath)
 
@@ -596,6 +598,21 @@ class QuakeScopePicksDownloader:
         # Track files written during this run (populated by download_picks_for_station
         # when write_immediately=True)
         self._immediate_files = []
+
+        # Create the picks directory and a dated subdirectory for every day in
+        # the requested timeframe upfront, so they are ready to receive files as
+        # soon as each day's download completes.
+        if organize_by_day:
+            from datetime import datetime as _dt, timedelta as _td
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            _start_date = _dt.strptime(start_time[:10], '%Y-%m-%d').date()
+            _end_date   = _dt.strptime(end_time[:10],   '%Y-%m-%d').date()
+            _cur = _start_date
+            while _cur <= _end_date:
+                (self.output_dir / str(_cur)).mkdir(exist_ok=True)
+                _cur += _td(days=1)
+            print(f"Created day directories {_start_date} → {_end_date} "
+                  f"under {self.output_dir}")
 
         # Download — when organize_by_day is True each day's picks are written
         # to disk as soon as they arrive, so nothing is held in memory until the end
