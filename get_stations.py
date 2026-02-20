@@ -298,7 +298,12 @@ def create_pyocto_stations_df(
             .copy()
         )
         # Recover the latest end date across all location codes for this station.
-        latest_ends = stations_df.groupby('physical_station')['end_date'].max()
+        # Use a custom aggregation with Python's native max() to avoid pandas/numpy
+        # converting UTCDateTime objects to floats via __float__ during groupby.max().
+        def _utc_max(s):
+            vals = [v for v in s if v is not None and v == v]  # v==v rejects NaN floats
+            return max(vals) if vals else None
+        latest_ends = stations_df.groupby('physical_station')['end_date'].agg(_utc_max)
         unique_stations['end_date'] = unique_stations['physical_station'].map(latest_ends)
         # Use NET.STA. (empty location code) as the canonical tid for PyOcto.
         unique_stations['tid'] = unique_stations['physical_station'] + '.'
@@ -310,6 +315,24 @@ def create_pyocto_stations_df(
     from obspy import Inventory
     from obspy.core.inventory import Network, Station
     from obspy import UTCDateTime
+
+    def _to_utc(val):
+        """Convert val to UTCDateTime, handling UTCDateTime objects, floats (epoch
+        seconds, as produced when pandas converts UTCDateTime via __float__), ISO
+        strings (as read back from CSV), and None/NaN."""
+        if val is None:
+            return None
+        if isinstance(val, UTCDateTime):
+            return val
+        try:
+            if pd.isna(val):
+                return None
+        except (TypeError, ValueError):
+            pass
+        try:
+            return UTCDateTime(float(val))
+        except (ValueError, TypeError):
+            return UTCDateTime(str(val))
 
     networks = {}
     for _, row in unique_stations.iterrows():
@@ -332,8 +355,8 @@ def create_pyocto_stations_df(
                 latitude=row['latitude'],
                 longitude=row['longitude'],
                 elevation=row['elevation'],
-                start_date=UTCDateTime(row['start_date']) if pd.notna(row['start_date']) else None,
-                end_date=UTCDateTime(row['end_date']) if pd.notna(row['end_date']) else None
+                start_date=_to_utc(row['start_date']),
+                end_date=_to_utc(row['end_date'])
             )
             networks[net_code].stations.append(sta)
     
