@@ -13,12 +13,14 @@ Steps:
 Usage:
   python workflow.py --config config.yaml
   python workflow.py --resume ./quakescope_output
+  python workflow.py --plot  ./quakescope_output
 
 Author: Grant
 Date: 2025-01-29
 """
 
 import json
+import logging
 import sys
 from pathlib import Path
 import argparse
@@ -353,6 +355,9 @@ Examples:
   # Resume an interrupted download
   python workflow.py --resume ./quakescope_output
 
+  # Generate diagnostic plots and summaries from a completed download
+  python workflow.py --plot ./quakescope_output
+
 See config.yaml for a fully annotated example of all available options.
         """
     )
@@ -372,14 +377,48 @@ See config.yaml for a fully annotated example of all available options.
             'saved there; no other flags are needed (or used).'
         )
     )
+    parser.add_argument(
+        '--plot', metavar='OUTPUT_DIR',
+        help=(
+            'Generate diagnostic figures and summary statistics from a '
+            'completed download. Pass the output directory used during the '
+            'original run. Produces per-station figures, network heatmaps, '
+            'geographic and temporal summary plots, and CSV/text summaries. '
+            'Does not re-download any data.'
+        )
+    )
 
     args = parser.parse_args()
 
-    if args.resume and args.config:
-        parser.error('--config and --resume are mutually exclusive.')
+    # Enforce mutual exclusivity
+    modes = [m for m in ('config', 'resume', 'plot') if getattr(args, m)]
+    if len(modes) > 1:
+        parser.error(
+            f'--{modes[0]} and --{modes[1]} are mutually exclusive. '
+            'Specify exactly one mode.'
+        )
+    if not modes:
+        parser.error('One of --config, --resume, or --plot is required.')
 
-    if not args.resume and not args.config:
-        parser.error('One of --config or --resume is required.')
+    # ── Plot-only mode ──────────────────────────────────────────────────────
+    if args.plot:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s  %(levelname)-8s  %(message)s',
+            datefmt='%H:%M:%S',
+        )
+        plot_dir = Path(args.plot)
+        if not plot_dir.exists():
+            print(f'ERROR: Directory not found: {plot_dir}')
+            sys.exit(1)
+        # Deferred import keeps matplotlib's Agg backend out of download runs
+        from plotting import run_plotting
+        print('=' * 80)
+        print(' QuakeScope Pick Plotter')
+        print('=' * 80)
+        print(f'\nOutput directory : {plot_dir}')
+        run_plotting(str(plot_dir))
+        return
 
     # ── Resume mode ────────────────────────────────────────────────────────
     if args.resume:
