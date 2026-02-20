@@ -171,9 +171,12 @@ def get_stations_with_metadata(
         print(f"Error querying FDSN: {e}")
         return pd.DataFrame()
     
-    # Extract station information
+    # Extract station information — one row per (network, station, location_code).
+    # Each location code gets its own operational window and channel type list so
+    # that retired location codes (e.g. IU.CCM.60, active 1999-2018) are tracked
+    # separately from currently active ones (IU.CCM.00, IU.CCM.10, …).
     stations_data = []
-    
+
     for network in inventory:
         net_code = network.code
         for station in network:
@@ -181,57 +184,64 @@ def get_stations_with_metadata(
             sta_lat = station.latitude
             sta_lon = station.longitude
             sta_elev = station.elevation
-            
-            # Collect all channels for this station
-            channel_prefixes = set()
-            earliest_start = None
-            latest_end = None
-            
+
+            # Group channels by location code so each location gets its own row.
+            loc_data: dict = {}  # loc_code -> {prefixes, earliest_start, latest_end}
+
             for channel in station:
                 loc_code = channel.location_code if channel.location_code else ''
                 chan_code = channel.code
                 start_date = channel.start_date
                 end_date = channel.end_date
-                
-                # Get 2-letter channel prefix (e.g., HH from HHZ)
+
+                if loc_code not in loc_data:
+                    loc_data[loc_code] = {
+                        'prefixes': set(),
+                        'earliest_start': None,
+                        'latest_end': None,
+                    }
+
+                d = loc_data[loc_code]
                 if len(chan_code) >= 2:
-                    channel_prefixes.add(chan_code[:2])
-                
-                # Track earliest start and latest end across all channels
-                if earliest_start is None or (start_date and start_date < earliest_start):
-                    earliest_start = start_date
-                if latest_end is None or (end_date and end_date > latest_end):
-                    latest_end = end_date
-            
-            # Create trace ID (using location from first channel)
-            # For stations with multiple location codes, this picks one arbitrarily
-            # which is fine since we're just using it as a station identifier
-            tid = f"{net_code}.{sta_code}.{loc_code if loc_code else ''}"
-            
-            stations_data.append({
-                'network': net_code,
-                'station': sta_code,
-                'location': loc_code,
-                'channels': ','.join(sorted(channel_prefixes)),  # e.g., "BH,HH"
-                'latitude': sta_lat,
-                'longitude': sta_lon,
-                'elevation': sta_elev,
-                'start_date': earliest_start,
-                'end_date': latest_end,
-                'tid': tid
-            })
-    
+                    d['prefixes'].add(chan_code[:2])
+
+                if d['earliest_start'] is None or (start_date and start_date < d['earliest_start']):
+                    d['earliest_start'] = start_date
+                if d['latest_end'] is None or (end_date and end_date > d['latest_end']):
+                    d['latest_end'] = end_date
+
+            # Emit one row per location code found at this station.
+            physical_station = f"{net_code}.{sta_code}"
+            for loc_code, d in loc_data.items():
+                tid = f"{net_code}.{sta_code}.{loc_code}"
+                stations_data.append({
+                    'network': net_code,
+                    'station': sta_code,
+                    'location': loc_code,
+                    'physical_station': physical_station,
+                    'channels': ','.join(sorted(d['prefixes'])),
+                    'latitude': sta_lat,
+                    'longitude': sta_lon,
+                    'elevation': sta_elev,
+                    'start_date': d['earliest_start'],
+                    'end_date': d['latest_end'],
+                    'tid': tid,
+                })
+
     df = pd.DataFrame(stations_data)
-    
-    # Deduplicate by tid (shouldn't be needed but just in case)
+
+    # Deduplicate by tid (each NET.STA.LOC should already be unique, but guard
+    # against edge cases where FDSN returns the same location code twice).
     df = df.drop_duplicates(subset='tid')
-    
+
     if not df.empty:
-        print(f"Found {len(df)} unique stations")
+        n_phys = df['physical_station'].nunique()
+        print(f"Found {len(df)} unique station/location combinations "
+              f"across {n_phys} physical stations")
         print(f"Channel types found: {sorted(set(','.join(df['channels'].unique()).split(',')))}")
     else:
         print("No stations found")
-    
+
     return df
 
 
@@ -274,29 +284,48 @@ def create_pyocto_stations_df(
         print("Falling back to simple approximation (NOT RECOMMENDED)")
         return _create_stations_simple_approx(stations_df), None
     
-    # Get unique stations (not channels)
-    unique_stations = stations_df.drop_duplicates(subset='tid')
-    
+    # Collapse to one entry per physical station (NET.STA) for the PyOcto
+    # coordinate frame.  When stations_df was produced by get_stations_with_metadata
+    # it now contains one row per location code; we deduplicate on the physical
+    # station key so that PyOcto sees a single coordinate per site.
+    # Use the earliest start / latest end across all location codes for the
+    # ObsPy Station object (only used for inventory_to_df projection).
+    if 'physical_station' in stations_df.columns:
+        unique_stations = (
+            stations_df
+            .sort_values('start_date')
+            .drop_duplicates(subset='physical_station', keep='first')
+            .copy()
+        )
+        # Recover the latest end date across all location codes for this station.
+        latest_ends = stations_df.groupby('physical_station')['end_date'].max()
+        unique_stations['end_date'] = unique_stations['physical_station'].map(latest_ends)
+        # Use NET.STA. (empty location code) as the canonical tid for PyOcto.
+        unique_stations['tid'] = unique_stations['physical_station'] + '.'
+    else:
+        # Fallback for DataFrames produced by older versions of get_stations_with_metadata.
+        unique_stations = stations_df.drop_duplicates(subset='tid')
+
     # Create ObsPy inventory from the station data
     from obspy import Inventory
     from obspy.core.inventory import Network, Station
     from obspy import UTCDateTime
-    
+
     networks = {}
     for _, row in unique_stations.iterrows():
         net_code = row['network']
         sta_code = row['station']
-        
+
         if net_code not in networks:
             networks[net_code] = Network(code=net_code)
-        
+
         # Check if station already exists in network
         sta_exists = False
         for sta in networks[net_code]:
             if sta.code == sta_code:
                 sta_exists = True
                 break
-        
+
         if not sta_exists:
             sta = Station(
                 code=sta_code,
@@ -371,8 +400,12 @@ def _create_stations_simple_approx(stations_df: pd.DataFrame) -> pd.DataFrame:
     This is only used if PyOcto projection fails.
     """
     import numpy as np
-    
-    unique_stations = stations_df.drop_duplicates(subset='tid')
+
+    if 'physical_station' in stations_df.columns:
+        unique_stations = stations_df.drop_duplicates(subset='physical_station').copy()
+        unique_stations['tid'] = unique_stations['physical_station'] + '.'
+    else:
+        unique_stations = stations_df.drop_duplicates(subset='tid')
     
     reference_lat = unique_stations['latitude'].mean()
     reference_lon = unique_stations['longitude'].mean()
