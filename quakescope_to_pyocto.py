@@ -149,7 +149,8 @@ class QuakeScopePicksDownloader:
                                    phases: Optional[List[str]] = None,
                                    min_score: float = 0.0,
                                    max_score: float = 1.0,
-                                   channel: Optional[str] = None) -> pd.DataFrame:
+                                   channel: Optional[str] = None,
+                                   write_immediately: bool = False) -> pd.DataFrame:
         """
         Download picks for a single station from QuakeScope.
 
@@ -177,7 +178,12 @@ class QuakeScopePicksDownloader:
             Score/probability range (0.0 to 1.0)
         channel : str, optional
             Channel code filter (e.g., 'EH', 'HH', 'BH')
-            
+        write_immediately : bool, optional
+            If True, format and write each day's picks to a CSV file as soon as
+            that day's data is successfully downloaded, rather than holding all
+            picks in memory until the end.  Written paths are appended to
+            self._immediate_files (if that attribute exists).
+
         Returns:
         --------
         pd.DataFrame
@@ -242,6 +248,8 @@ class QuakeScopePicksDownloader:
             # If phases specified, query each phase separately
             phase_list = phases if phases else [None]
 
+            day_picks = []  # Raw picks collected for this single day (all phases)
+
             for phase in phase_list:
                 params = {
                     'tid': tid,
@@ -266,6 +274,7 @@ class QuakeScopePicksDownloader:
                         df = pd.read_csv(StringIO(response.text), delimiter='|')
                         if not df.empty:
                             all_picks.append(df)
+                            day_picks.append(df)
 
                         # Warn if we hit the limit even with daily chunks
                         if len(df) >= self.max_limit:
@@ -280,6 +289,29 @@ class QuakeScopePicksDownloader:
                 # Be nice to the server
                 time.sleep(0.05)
 
+            # Write this day's picks to disk immediately after all phases are done
+            if write_immediately and day_picks:
+                day_df = pd.concat(day_picks, ignore_index=True)
+                formatted_day = self.format_for_pyocto(day_df)
+                if not formatted_day.empty:
+                    # Derive a clean station name from the picks data itself so
+                    # the filename matches what organize_by_station_day() would use
+                    station_name = formatted_day['station'].iloc[0]
+                    station_clean = station_name.replace('.', '_').replace(' ', '_')
+                    key = f"{station_clean}_{active_date}"
+                    filepath = self.output_dir / f"{key}_picks.csv"
+                    # If a file already exists for this station-day (e.g. from a
+                    # previous partial run), append and re-sort rather than clobber
+                    if filepath.exists():
+                        existing = pd.read_csv(filepath)
+                        formatted_day = pd.concat(
+                            [existing, formatted_day], ignore_index=True
+                        ).sort_values('time').reset_index(drop=True)
+                    formatted_day.to_csv(filepath, index=False)
+                    print(f"  Wrote {len(formatted_day)} picks → {filepath.name}")
+                    if hasattr(self, '_immediate_files'):
+                        self._immediate_files.append(filepath)
+
         if all_picks:
             return pd.concat(all_picks, ignore_index=True)
         else:
@@ -292,7 +324,8 @@ class QuakeScopePicksDownloader:
                            phases: Optional[List[str]] = None,
                            min_score: float = 0.0,
                            max_score: float = 1.0,
-                           channel: Optional[str] = None) -> pd.DataFrame:
+                           channel: Optional[str] = None,
+                           write_immediately: bool = False) -> pd.DataFrame:
         """
         Download picks for multiple stations.
 
@@ -317,7 +350,10 @@ class QuakeScopePicksDownloader:
             Score/probability range
         channel : str, optional
             Channel code filter
-            
+        write_immediately : bool, optional
+            Passed through to download_picks_for_station().  When True, each
+            day's picks are written to a CSV file immediately after download.
+
         Returns:
         --------
         pd.DataFrame
@@ -362,7 +398,8 @@ class QuakeScopePicksDownloader:
                 phases=phases,
                 min_score=min_score,
                 max_score=max_score,
-                channel=channel
+                channel=channel,
+                write_immediately=write_immediately
             )
             if not picks.empty:
                 all_picks.append(picks)
@@ -556,7 +593,12 @@ class QuakeScopePicksDownloader:
         list of Path
             List of saved file paths
         """
-        # Download
+        # Track files written during this run (populated by download_picks_for_station
+        # when write_immediately=True)
+        self._immediate_files = []
+
+        # Download — when organize_by_day is True each day's picks are written
+        # to disk as soon as they arrive, so nothing is held in memory until the end
         raw_picks = self.download_picks_bulk(
             stations_df=stations_df,
             start_time=start_time,
@@ -564,28 +606,29 @@ class QuakeScopePicksDownloader:
             phases=phases,
             min_score=min_score,
             max_score=max_score,
-            channel=channel
+            channel=channel,
+            write_immediately=organize_by_day
         )
-        
+
+        if organize_by_day:
+            # Files were already written per day; skip the redundant
+            # format → organize → save pipeline
+            if not self._immediate_files:
+                print("No picks found for given criteria")
+                return []
+            print(f"Organized into {len(self._immediate_files)} station-day files")
+            print(f"\nSaved {len(self._immediate_files)} pick files to {self.output_dir}")
+            return self._immediate_files
+
+        # organize_by_day=False: save all picks in a single combined file
         if raw_picks.empty:
             print("No picks found for given criteria")
             return []
-        
-        # Format for PyOcto
+
         pyocto_picks = self.format_for_pyocto(raw_picks)
         print(f"Formatted {len(pyocto_picks)} picks for PyOcto")
-        
-        # Save
-        if organize_by_day:
-            # Organize by station/day
-            organized = self.organize_by_station_day(pyocto_picks)
-            print(f"Organized into {len(organized)} station-day files")
-            saved_files = self.save_picks(organized, format=output_format)
-        else:
-            # Save all in one file
-            saved_files = [self.save_combined(pyocto_picks, 
-                                             f"picks_{start_time[:10]}_{end_time[:10]}.csv")]
-        
+        saved_files = [self.save_combined(pyocto_picks,
+                                          f"picks_{start_time[:10]}_{end_time[:10]}.csv")]
         return saved_files
 
 
