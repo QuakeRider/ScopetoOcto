@@ -6,10 +6,11 @@ Download phase picks from the QuakeScope database and format them for PyOcto pha
 
 This toolkit downloads picks from QuakeScope and prepares them in the format required by PyOcto:
 1. Queries FDSN web services for stations within geographic bounds
-2. Downloads picks from QuakeScope for those stations  
-3. Formats picks in PyOcto format (station, time, phase, probability)
-4. Formats stations in PyOcto format (station, x, y, z)
-5. Organizes picks by station and day
+2. Identifies active days per station via the QuakeScope `picks_record` endpoint (avoids redundant queries)
+3. Downloads picks day-by-day from QuakeScope for those stations, writing each file immediately to disk
+4. Formats picks in PyOcto format (station, time, phase, probability)
+5. Formats stations in PyOcto format (station, x, y, z) using a proper Transverse Mercator projection
+6. Organizes picks into per-day subdirectories (`picks/YYYY-MM-DD/`)
 
 ## Important: QuakeScope Limitation
 
@@ -57,15 +58,21 @@ python workflow.py \
 The script creates:
 ```
 quakescope_output/
-├── station_metadata.csv      # Full station info from FDSN
+├── station_metadata.csv       # Full station info from FDSN
 ├── pyocto_stations.csv        # Stations in PyOcto format (projected coordinates)
 ├── crs_info.json              # Coordinate Reference System information
 └── picks/
-    ├── UW_STA1__2024-01-01_picks.csv
-    ├── UW_STA1__2024-01-02_picks.csv
-    ├── UW_STA2__2024-01-01_picks.csv
+    ├── 2024-01-01/
+    │   ├── UW_STA1__2024-01-01_picks.csv
+    │   ├── UW_STA2__2024-01-01_picks.csv
+    │   └── ...
+    ├── 2024-01-02/
+    │   ├── UW_STA1__2024-01-02_picks.csv
+    │   └── ...
     └── ...
 ```
+
+Pick files are written to disk immediately after each station-day is downloaded, so results are available incrementally and partial runs are not lost.
 
 ### PyOcto Stations Format
 Columns: `station`, `x`, `y`, `z` (coordinates in km)
@@ -165,30 +172,35 @@ pick_files = downloader.run(
 
 ## QuakeScope API Details
 
-The script uses the QuakeScope picks API:
-- **Endpoint**: `https://dasway.ess.washington.edu/quakescope/service/picks/query`
+The script uses two QuakeScope endpoints:
+
+### picks endpoint (pick download)
+- **URL**: `https://dasway.ess.washington.edu/quakescope/service/picks/query`
 - **Format**: Pipe-delimited CSV
 - **Limit**: 10,000 picks per query (script warns if limit is hit)
+- **Query parameters**:
+  - `tid`: Trace ID (`NET.STA.LOC`)
+  - `channel`: 2-letter channel code
+  - `start_time`, `end_time`: ISO format times
+  - `phase`: P or S
+  - `min_score`, `max_score`: Confidence score range (0–1)
+  - `limit`: Max results per query
 
-### QuakeScope Response Columns
+### picks_record endpoint (active-day detection)
+- **URL**: `https://dasway.ess.washington.edu/quakescope/service/picks_record/query`
+- **Purpose**: Returns a lightweight record of which calendar days have picks for a given station. Used by the script to skip days with no data before issuing full pick queries, significantly reducing API calls for sparse regions.
+
+### QuakeScope Response Columns (picks)
 ```
-trace_id | network_code | station_code | location_code | channel | 
+trace_id | network_code | station_code | location_code | channel |
 start_time | peak_time | end_time | confidence | amplitude | phase
 ```
 
-The script uses:
-- `trace_id` → PyOcto `station`
-- `peak_time` → PyOcto `time` (converted to Unix timestamp)
-- `phase` → PyOcto `phase` (uppercase)
-- `confidence` → PyOcto `probability`
-
-### QuakeScope Query Parameters
-- `tid`: Trace ID (NET.STA.LOC)
-- `channel`: 2-letter channel code
-- `start_time`, `end_time`: ISO format times
-- `phase`: P or S
-- `min_score`, `max_score`: Score range (0-1)
-- `limit`: Max results per query
+Column mapping to PyOcto format:
+- `trace_id` → `station`
+- `peak_time` → `time` (converted to Unix timestamp)
+- `phase` → `phase` (forced to uppercase)
+- `confidence` → `probability`
 
 ## PyOcto Format Details
 
@@ -234,6 +246,20 @@ Required columns for PyOcto:
 - The script will fall back to simple approximation
 - Install PyOcto with: `pip install pyocto`
 - For production use, PyOcto is required for proper coordinate projection
+
+## Citation
+
+If you use this tool in your research, please cite the QuakeScope database:
+
+> Ni, Y., Denolle, M., Thomas, A., Hamilton, A., Münchmeyer, J., Wang, Y., Bachelot, L.,
+> Trabant, C., & Mencin, D. (2025). A Global-scale Database of Seismic Phases from
+> Cloud-based Picking at Petabyte Scale. *Seismica*, 4(2).
+> https://doi.org/10.26443/seismica.v4i2.1738
+
+QuakeScope produced 4.3 billion P- and S-wave picks from 1.3 PB of continuous seismic data
+spanning 47,354 stations (2002–2025), using the PhaseNet deep-learning picker via SeisBench
+on AWS cloud infrastructure. Picks are publicly queryable at
+`https://dasway.ess.washington.edu/quakescope`.
 
 ## License
 
