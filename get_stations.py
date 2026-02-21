@@ -186,7 +186,7 @@ def get_stations_with_metadata(
             sta_elev = station.elevation
 
             # Group channels by location code so each location gets its own row.
-            loc_data: dict = {}  # loc_code -> {prefixes, earliest_start, latest_end}
+            loc_data: dict = {}  # loc_code -> {prefixes, earliest_start, latest_end, is_active}
 
             for channel in station:
                 loc_code = channel.location_code if channel.location_code else ''
@@ -199,6 +199,10 @@ def get_stations_with_metadata(
                         'prefixes': set(),
                         'earliest_start': None,
                         'latest_end': None,
+                        # True once any channel epoch has end_date=None (still active).
+                        # When True, the location code is open-ended regardless of any
+                        # other channel's retirement date.
+                        'is_active': False,
                     }
 
                 d = loc_data[loc_code]
@@ -207,8 +211,17 @@ def get_stations_with_metadata(
 
                 if d['earliest_start'] is None or (start_date and start_date < d['earliest_start']):
                     d['earliest_start'] = start_date
-                if d['latest_end'] is None or (end_date and end_date > d['latest_end']):
-                    d['latest_end'] = end_date
+
+                # Track the latest end date correctly across multiple channel epochs.
+                # A channel with end_date=None means that epoch is still running, so
+                # the location code is currently active.  Once we know the location is
+                # active we stop updating latest_end — an open-ended station must not
+                # have its end_date pinned to a retired channel epoch's close date.
+                if end_date is None:
+                    d['is_active'] = True
+                elif not d['is_active']:
+                    if d['latest_end'] is None or end_date > d['latest_end']:
+                        d['latest_end'] = end_date
 
             # Emit one row per location code found at this station.
             physical_station = f"{net_code}.{sta_code}"
@@ -224,7 +237,9 @@ def get_stations_with_metadata(
                     'longitude': sta_lon,
                     'elevation': sta_elev,
                     'start_date': d['earliest_start'],
-                    'end_date': d['latest_end'],
+                    # None signals open-ended (currently active); only use the
+                    # latest channel end date when no epoch is still running.
+                    'end_date': None if d['is_active'] else d['latest_end'],
                     'tid': tid,
                 })
 
