@@ -127,6 +127,7 @@ def download_and_format_picks(
     use_pyocto_projection: bool = True,
     resume: bool = False,
     download_chunk_size: str = 'month',
+    workers: int = 0,
 ):
     """
     Download picks from QuakeScope and format for PyOcto.
@@ -178,6 +179,10 @@ def download_and_format_picks(
         ``'month'`` (default), or ``'year'``.  Larger values mean fewer API
         round-trips and faster downloads.  Automatic fallback to finer
         granularity occurs when the 10 000-pick limit is hit.
+    workers : int
+        Number of parallel worker processes for the deduplication step.
+        0 = auto-detect (uses all available CPU cores).
+        1 = sequential (no sub-processes).
     """
     print("="*80)
     print(" QuakeScope Pick Downloader" + (" (RESUMING)" if resume else ""))
@@ -234,6 +239,7 @@ def download_and_format_picks(
             'channel_priority': channel_priority,
             'use_pyocto_projection': use_pyocto_projection,
             'download_chunk_size': download_chunk_size,
+            'workers': workers,
             'output_dir': str(output_path.absolute()),
         }
         save_run_config(output_path, config)
@@ -320,6 +326,7 @@ def download_and_format_picks(
         channel_priority=channel_priority,
         resume=resume,
         chunk_size=download_chunk_size,
+        dedup_workers=workers,
     )
 
     # Summary
@@ -457,6 +464,7 @@ See config.yaml for a fully annotated example of all available options.
             channel_priority=config.get('channel_priority'),
             use_pyocto_projection=config.get('use_pyocto_projection', True),
             download_chunk_size=config.get('download_chunk_size', 'month'),
+            workers=config.get('workers', 0),
             resume=True,
         )
         if result is None:
@@ -491,6 +499,7 @@ See config.yaml for a fully annotated example of all available options.
         channel_priority=config.get('channel_priority'),
         use_pyocto_projection=config.get('use_pyocto_projection', True),
         download_chunk_size=config.get('download_chunk_size', 'month'),
+        workers=config.get('workers', 0),
         resume=False,
     )
 
