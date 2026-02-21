@@ -10,14 +10,141 @@ Date: 2025-01-29
 """
 
 import json
+import os
 import pandas as pd
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 import requests
 from io import StringIO
 import time
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers — must be top-level so ProcessPoolExecutor can pickle them
+# ---------------------------------------------------------------------------
+
+def _dedup_picks(
+    picks_df: pd.DataFrame,
+    time_threshold: float,
+    channel_priority: List[str],
+) -> pd.DataFrame:
+    """Core cross-location deduplication logic (picklable, no class dependency).
+
+    Called by both QuakeScopePicksDownloader.deduplicate_picks_cross_location
+    and the parallel worker _dedup_day_dir.
+    """
+    if picks_df.empty:
+        return picks_df.copy()
+
+    priority_map = {ch: i for i, ch in enumerate(channel_priority)}
+    n_fallback = len(channel_priority)
+
+    picks_df = picks_df.copy()
+    picks_df['_priority'] = (
+        picks_df['channel']
+        .map(priority_map)
+        .fillna(n_fallback)
+        .astype(int)
+    )
+
+    result_pieces = []
+    for phase, phase_picks in picks_df.groupby('phase'):
+        phase_picks = phase_picks.sort_values('time').reset_index(drop=True)
+        times = phase_picks['time'].to_numpy()
+
+        group_ids = np.zeros(len(times), dtype=int)
+        for i in range(1, len(times)):
+            group_ids[i] = group_ids[i - 1] + (
+                1 if (times[i] - times[i - 1]) > time_threshold else 0
+            )
+        phase_picks['_group'] = group_ids
+
+        kept_idx = phase_picks.groupby('_group')['_priority'].idxmin()
+        result_pieces.append(phase_picks.loc[kept_idx])
+
+    if not result_pieces:
+        return pd.DataFrame(columns=picks_df.columns)
+
+    deduped = pd.concat(result_pieces, ignore_index=True)
+    deduped = deduped.drop(columns=['_priority', '_group'])
+
+    deduped['station'] = deduped['station'].apply(
+        lambda s: '.'.join(s.split('.')[:2]) + '.'
+    )
+    return deduped.sort_values('time').reset_index(drop=True)
+
+
+def _dedup_day_dir(
+    day_dir: Path,
+    tid_to_phys: dict,
+    time_threshold: float,
+    channel_priority: List[str],
+) -> tuple:
+    """Process one calendar-day directory in a worker process.
+
+    Merges per-location pick files for each physical station, deduplicates
+    them, writes a single merged output file, and deletes the source files.
+
+    Returns
+    -------
+    tuple[int, list[str]]
+        (number of station-day files written, list of log/warning strings)
+    """
+    merged_count = 0
+    messages = []
+
+    phys_groups: dict = {}
+    for fpath in day_dir.glob('*_picks.csv'):
+        stem = fpath.stem.replace('_picks', '')
+        phys = tid_to_phys.get(stem)
+        if phys is None:
+            continue
+        phys_groups.setdefault(phys, []).append(fpath)
+
+    for phys_sta, fpaths in phys_groups.items():
+        if not fpaths:
+            continue
+
+        dfs = []
+        for fp in fpaths:
+            try:
+                df = pd.read_csv(fp)
+                if not df.empty:
+                    dfs.append(df)
+            except Exception as e:
+                messages.append(f"  WARNING: could not read {fp}: {e}")
+
+        if not dfs:
+            for fp in fpaths:
+                fp.unlink(missing_ok=True)
+            continue
+
+        merged = pd.concat(dfs, ignore_index=True)
+        deduped = _dedup_picks(merged, time_threshold=time_threshold,
+                               channel_priority=channel_priority)
+
+        phys_clean = phys_sta.replace('.', '_')
+        out_path = day_dir / f"{phys_clean}__picks.csv"
+
+        n_src = len(merged)
+        deduped.to_csv(out_path, index=False)
+
+        messages.append(
+            f"  {day_dir.name}/{out_path.name}: "
+            f"{n_src} picks → {len(deduped)} after dedup "
+            f"({len(fpaths)} location file(s) merged)"
+        )
+
+        for fp in fpaths:
+            if fp.resolve() != out_path.resolve():
+                fp.unlink(missing_ok=True)
+
+        merged_count += 1
+
+    return merged_count, messages
 
 
 class QuakeScopePicksDownloader:
@@ -786,61 +913,17 @@ class QuakeScopePicksDownloader:
         pd.DataFrame
             Deduplicated picks with ``station`` normalised to ``NET.STA.``.
         """
-        if picks_df.empty:
-            return picks_df.copy()
-
         if channel_priority is None:
             channel_priority = self.DEFAULT_CHANNEL_PRIORITY
-
-        priority_map = {ch: i for i, ch in enumerate(channel_priority)}
-        n_fallback = len(channel_priority)  # rank for unknown channel types
-
-        picks_df = picks_df.copy()
-        picks_df['_priority'] = (
-            picks_df['channel']
-            .map(priority_map)
-            .fillna(n_fallback)
-            .astype(int)
-        )
-
-        result_pieces = []
-
-        for phase, phase_picks in picks_df.groupby('phase'):
-            phase_picks = phase_picks.sort_values('time').reset_index(drop=True)
-            times = phase_picks['time'].to_numpy()
-
-            # Assign group IDs: new group whenever gap > threshold.
-            group_ids = np.zeros(len(times), dtype=int)
-            for i in range(1, len(times)):
-                group_ids[i] = group_ids[i - 1] + (
-                    1 if (times[i] - times[i - 1]) > time_threshold else 0
-                )
-            phase_picks['_group'] = group_ids
-
-            # Within each group keep the pick with the lowest priority number
-            # (= highest channel quality).
-            kept_idx = phase_picks.groupby('_group')['_priority'].idxmin()
-            result_pieces.append(phase_picks.loc[kept_idx])
-
-        if not result_pieces:
-            return pd.DataFrame(columns=picks_df.columns)
-
-        deduped = pd.concat(result_pieces, ignore_index=True)
-        deduped = deduped.drop(columns=['_priority', '_group'])
-
-        # Normalise station to NET.STA. (physical station id, empty location).
-        # The location code and channel are preserved in their own columns.
-        deduped['station'] = deduped['station'].apply(
-            lambda s: '.'.join(s.split('.')[:2]) + '.'
-        )
-
-        return deduped.sort_values('time').reset_index(drop=True)
+        return _dedup_picks(picks_df, time_threshold=time_threshold,
+                            channel_priority=channel_priority)
 
     def merge_and_deduplicate_station_day_files(
         self,
         stations_df: pd.DataFrame,
         time_threshold: float = 0.5,
         channel_priority: Optional[List[str]] = None,
+        workers: int = 0,
     ) -> int:
         """
         Post-processing pass: merge per-location-code pick files into one
@@ -857,6 +940,9 @@ class QuakeScopePicksDownloader:
              empty location code) per physical station per day.
           4. Deletes the per-location-code source files.
 
+        Day directories are processed in parallel when *workers* > 1 or when
+        *workers* is 0 and more than one CPU is available.
+
         Parameters
         ----------
         stations_df : pd.DataFrame
@@ -866,6 +952,10 @@ class QuakeScopePicksDownloader:
             Passed to deduplicate_picks_cross_location().
         channel_priority : list of str, optional
             Passed to deduplicate_picks_cross_location().
+        workers : int
+            Number of worker processes for the dedup pass.
+            0 = auto-detect (uses all available CPU cores).
+            1 = sequential (no sub-processes).
 
         Returns
         -------
@@ -877,6 +967,14 @@ class QuakeScopePicksDownloader:
                   "skipping merge/dedup pass.")
             return 0
 
+        # Resolve workers: 0 = auto-detect.
+        effective_workers = workers if workers > 0 else (os.cpu_count() or 1)
+
+        # Resolve channel_priority before passing to worker processes so they
+        # don't need access to the class constant.
+        if channel_priority is None:
+            channel_priority = self.DEFAULT_CHANNEL_PRIORITY
+
         # Build a mapping from per-location filename stem → physical station id.
         # File names are like  IU_CCM_60_picks.csv  (tid with dots→underscores).
         tid_to_phys: dict = {}
@@ -884,69 +982,38 @@ class QuakeScopePicksDownloader:
             tid_clean = row['tid'].replace('.', '_')
             tid_to_phys[tid_clean] = row['physical_station']
 
+        day_dirs = [d for d in sorted(self.output_dir.iterdir()) if d.is_dir()]
         merged_count = 0
 
-        # Walk each day directory.
-        for day_dir in sorted(self.output_dir.iterdir()):
-            if not day_dir.is_dir():
-                continue
-
-            # Group pick files by physical station.
-            phys_groups: dict = {}  # physical_station → list of Path
-            for fpath in day_dir.glob('*_picks.csv'):
-                stem = fpath.stem.replace('_picks', '')  # e.g. IU_CCM_60
-                phys = tid_to_phys.get(stem)
-                if phys is None:
-                    # File may already be a merged file (IU_CCM_) — skip.
-                    continue
-                phys_groups.setdefault(phys, []).append(fpath)
-
-            for phys_sta, fpaths in phys_groups.items():
-                if not fpaths:
-                    continue
-
-                # Load and merge all location-code files for this station-day.
-                dfs = []
-                for fp in fpaths:
-                    try:
-                        df = pd.read_csv(fp)
-                        if not df.empty:
-                            dfs.append(df)
-                    except Exception as e:
-                        print(f"  WARNING: could not read {fp}: {e}")
-
-                if not dfs:
-                    for fp in fpaths:
-                        fp.unlink(missing_ok=True)
-                    continue
-
-                merged = pd.concat(dfs, ignore_index=True)
-                deduped = self.deduplicate_picks_cross_location(
-                    merged, time_threshold=time_threshold,
-                    channel_priority=channel_priority,
+        if effective_workers == 1 or len(day_dirs) <= 1:
+            # Sequential path — avoids subprocess overhead for small runs.
+            for day_dir in day_dirs:
+                count, messages = _dedup_day_dir(
+                    day_dir, tid_to_phys, time_threshold, channel_priority
                 )
-
-                # Write merged file: NET_STA__picks.csv (double underscore =
-                # empty location code, mirrors tid format NET.STA.)
-                phys_clean = phys_sta.replace('.', '_')
-                out_path = day_dir / f"{phys_clean}__picks.csv"
-
-                n_src = len(merged)
-                deduped.to_csv(out_path, index=False)
-
-                print(f"  {day_dir.name}/{out_path.name}: "
-                      f"{n_src} picks → {len(deduped)} after dedup "
-                      f"({len(fpaths)} location file(s) merged)")
-
-                # Delete per-location source files.  Skip the output file
-                # itself in the (rare) case where a station with an empty
-                # location code produced a source filename identical to the
-                # merged output filename.
-                for fp in fpaths:
-                    if fp.resolve() != out_path.resolve():
-                        fp.unlink(missing_ok=True)
-
-                merged_count += 1
+                for msg in messages:
+                    print(msg)
+                merged_count += count
+        else:
+            print(f"  Using {effective_workers} worker process(es) "
+                  f"across {len(day_dirs)} day director(ies)...")
+            with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _dedup_day_dir, day_dir, tid_to_phys,
+                        time_threshold, channel_priority
+                    ): day_dir
+                    for day_dir in day_dirs
+                }
+                for future in as_completed(futures):
+                    day_dir = futures[future]
+                    try:
+                        count, messages = future.result()
+                        for msg in messages:
+                            print(msg)
+                        merged_count += count
+                    except Exception as e:
+                        print(f"  WARNING: failed to process {day_dir.name}: {e}")
 
         print(f"\nMerge/dedup complete: {merged_count} station-day file(s) written.")
         return merged_count
@@ -1062,7 +1129,8 @@ class QuakeScopePicksDownloader:
             dedup_time_threshold: float = 0.5,
             channel_priority: Optional[List[str]] = None,
             resume: bool = False,
-            chunk_size: str = 'month') -> List[Path]:
+            chunk_size: str = 'month',
+            dedup_workers: int = 0) -> List[Path]:
         """
         Complete workflow: download, format, organize, deduplicate, and save picks.
 
@@ -1170,6 +1238,7 @@ class QuakeScopePicksDownloader:
                     stations_df=stations_df,
                     time_threshold=dedup_time_threshold,
                     channel_priority=channel_priority,
+                    workers=dedup_workers,
                 )
                 # Return the merged output files that now exist on disk.
                 merged_files = sorted(self.output_dir.rglob('*__picks.csv'))

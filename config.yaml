@@ -51,6 +51,10 @@ channel_priority: null       # Ordered list of 2-letter channel prefixes, best f
                              #   [HH, BH, EH, SH, HN, CN, EL, SL, EP, DP]
                              # Example override: [EH, HH, BH]
 
+workers: 0                   # Number of parallel worker processes for the deduplication
+                             # step. 0 = auto-detect (uses all available CPU cores).
+                             # Set to 1 to disable parallelism.
+
 use_pyocto_projection: true  # true  = use PyOcto's CRS projection (recommended).
                              # false = fall back to a simple lat/lon approximation.
 
