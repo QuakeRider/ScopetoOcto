@@ -553,6 +553,7 @@ class QuakeScopePicksDownloader:
                                    min_score: float = 0.0,
                                    max_score: float = 1.0,
                                    channel: Optional[str] = None,
+                                   station_channels: Optional[List[str]] = None,
                                    write_immediately: bool = False,
                                    chunk_size: str = 'month') -> pd.DataFrame:
         """
@@ -588,6 +589,15 @@ class QuakeScopePicksDownloader:
             Score/probability range (0.0 to 1.0)
         channel : str, optional
             Channel code filter (e.g., 'EH', 'HH', 'BH')
+        station_channels : list of str, optional
+            All 2-letter channel prefixes known to exist at this station/location
+            (e.g. ['HH', 'BH', 'EH']).  When provided and *channel* is None,
+            picks_record is queried once per channel prefix and the results are
+            unioned.  This ensures days are not missed when the QuakeScope
+            picks_record endpoint returns fewer results without a channel filter
+            — a common occurrence for stations whose sensor type changed over
+            time (the old and new sensor eras are indexed under different channel
+            prefixes).
         write_immediately : bool, optional
             If True, format and write each chunk's picks to per-day CSV files as
             soon as the chunk is downloaded.  Written paths are appended to
@@ -623,10 +633,24 @@ class QuakeScopePicksDownloader:
         if start_dt >= end_dt:
             return pd.DataFrame()
 
-        # Discover which days actually have picks (picks_record overview call).
+        # Discover which days actually have picks.
+        # When the station's channel types are known and no global channel filter
+        # is set, query picks_record once per channel prefix and union the results.
+        # This guards against picks_record returning an empty or incomplete day
+        # list when called without a channel filter — which happens for stations
+        # whose sensor type changed over time, because each sensor era's picks are
+        # indexed under a different channel prefix in the QuakeScope database.
         n_total_days = max((end_dt - start_dt).days, 1)
-        active_days = self.get_active_days_for_station(tid, start_dt, end_dt, channel=channel)
-        time.sleep(0.05)  # Be courteous to the server
+        if station_channels and channel is None:
+            all_active_days: set = set()
+            for ch in station_channels:
+                days = self.get_active_days_for_station(tid, start_dt, end_dt, channel=ch)
+                all_active_days.update(days)
+                time.sleep(0.05)
+            active_days = sorted(all_active_days)
+        else:
+            active_days = self.get_active_days_for_station(tid, start_dt, end_dt, channel=channel)
+            time.sleep(0.05)
 
         if not active_days:
             return pd.DataFrame()
@@ -755,11 +779,24 @@ class QuakeScopePicksDownloader:
             sta_start = row.get('start_date')
             sta_end = row.get('end_date')
 
+            # Extract per-station channel types for targeted picks_record queries.
+            # The 'channels' column (e.g. "BH,EH,HH") is set by
+            # get_stations_with_metadata and lists every 2-letter channel prefix
+            # present at this location code.  Passing these to
+            # download_picks_for_station lets it query picks_record once per
+            # channel prefix so that days indexed under any channel are found.
+            sta_channels_raw = row.get('channels', '')
+            sta_channels = (
+                [c.strip() for c in str(sta_channels_raw).split(',') if c.strip()]
+                if sta_channels_raw and str(sta_channels_raw).strip()
+                else None
+            )
+
             # Skip stations that were fully downloaded in a previous run.
             if tid in completed_tids:
                 print(f"\n[{i}/{len(stations_df)}] {tid} - SKIPPED (already downloaded)")
                 continue
-            
+
             # Show operational period - convert UTCDateTime to string if needed
             if pd.notna(sta_start) and pd.notna(sta_end):
                 # Convert to string if it's a UTCDateTime object
@@ -768,7 +805,7 @@ class QuakeScopePicksDownloader:
                 print(f"\n[{i}/{len(stations_df)}] {tid} (active: {start_str} to {end_str})")
             else:
                 print(f"\n[{i}/{len(stations_df)}] {tid}")
-            
+
             picks = self.download_picks_for_station(
                 tid=tid,
                 start_time=start_time,
@@ -779,6 +816,7 @@ class QuakeScopePicksDownloader:
                 min_score=min_score,
                 max_score=max_score,
                 channel=channel,
+                station_channels=sta_channels,
                 write_immediately=write_immediately,
                 chunk_size=chunk_size,
             )
