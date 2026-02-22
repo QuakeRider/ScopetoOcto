@@ -30,6 +30,9 @@ Author: Grant
 
 import json
 import logging
+import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +57,19 @@ except ImportError:
     )
 
 try:
+    # Ensure the PROJ data directory is discoverable before importing pyproj.
+    # In conda environments the database lives at $PREFIX/share/proj, but
+    # pyproj may not find it automatically when PROJ_DATA/PROJ_LIB are unset.
+    _proj_candidates = [
+        Path(sys.prefix) / "share" / "proj",
+        Path(sys.prefix) / "Library" / "share" / "proj",  # Windows conda
+    ]
+    for _p in _proj_candidates:
+        if _p.exists():
+            os.environ.setdefault("PROJ_DATA", str(_p))
+            os.environ.setdefault("PROJ_LIB",  str(_p))
+            break
+
     from pyproj import Transformer, CRS as ProjCRS
     HAS_PYPROJ = True
 except ImportError:
@@ -168,26 +184,62 @@ class PicksPlotter:
             f"Loaded locations for {len(self.station_locations)} stations via linear approx."
         )
 
+    @staticmethod
+    def _read_date_dir(date_dir: Path):
+        """Read all pick CSVs under a single date directory.
+
+        Returns a DataFrame with a ``_date_str`` column, or None if the
+        directory contained no readable data.
+        """
+        date_str = date_dir.name
+        chunks   = []
+        for fp in sorted(date_dir.glob("*.csv")):
+            try:
+                df = pd.read_csv(fp)
+                if not df.empty:
+                    df["_date_str"] = date_str
+                    chunks.append(df)
+            except Exception as exc:
+                logging.getLogger(__name__).warning(f"Skipping {fp}: {exc}")
+        return pd.concat(chunks, ignore_index=True) if chunks else None
+
     def _load_all_picks(self):
-        """Scan picks/YYYY-MM-DD/*.csv and build self.all_picks."""
+        """Scan picks/YYYY-MM-DD/*.csv and build self.all_picks.
+
+        Date directories are processed in parallel via a ThreadPoolExecutor,
+        which gives a large speed-up when there are hundreds of date
+        directories each containing thousands of station CSV files.
+        """
         if not self.picks_dir.exists():
             raise FileNotFoundError(f"Picks directory not found: {self.picks_dir}")
 
-        csv_files = sorted(self.picks_dir.rglob("*.csv"))
-        if not csv_files:
+        # Discover date directories (direct children of picks_dir) that
+        # contain at least one CSV file.
+        date_dirs = sorted(
+            d for d in self.picks_dir.iterdir()
+            if d.is_dir() and any(d.glob("*.csv"))
+        )
+        if not date_dirs:
             raise FileNotFoundError(f"No pick CSV files found in {self.picks_dir}")
 
-        logger.info(f"Reading {len(csv_files)} pick file(s)…")
-        chunks = []
-        for fp in csv_files:
-            try:
-                df = pd.read_csv(fp)
-                if df.empty:
-                    continue
-                df["_date_str"] = fp.parent.name   # YYYY-MM-DD from directory
-                chunks.append(df)
-            except Exception as exc:
-                logger.warning(f"Skipping {fp}: {exc}")
+        n_files = sum(len(list(d.glob("*.csv"))) for d in date_dirs)
+        logger.info(f"Reading {n_files:,} pick file(s) across {len(date_dirs)} date directories…")
+
+        n_workers = min(32, os.cpu_count() or 4)
+        logger.info(f"Loading picks with {n_workers} parallel workers…")
+
+        chunks    = []
+        done      = 0
+        n_dirs    = len(date_dirs)
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {executor.submit(self._read_date_dir, d): d for d in date_dirs}
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is not None:
+                    chunks.append(result)
+                done += 1
+                if done % max(1, n_dirs // 10) == 0 or done == n_dirs:
+                    logger.info(f"  Loaded {done}/{n_dirs} date directories…")
 
         if not chunks:
             raise ValueError("All pick files were empty or unreadable.")
@@ -884,7 +936,7 @@ class PicksPlotter:
                 "mean_amp_s":           s["amplitude"].mean()    if (not s.empty and s["amplitude"].notna().any()) else float("nan"),
                 "active_days":          len(dates_active),
                 "span_days":            len(full_dr),
-                "uptime_pct":           100 * len(dates_active) / len(full_dr) if full_dr else float("nan"),
+                "uptime_pct":           100 * len(dates_active) / len(full_dr) if len(full_dr) > 0 else float("nan"),
                 "picks_per_active_day": len(picks) / len(dates_active) if dates_active else float("nan"),
                 "first_pick":           str(dates_active[0]),
                 "last_pick":            str(dates_active[-1]),
