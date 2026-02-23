@@ -19,6 +19,45 @@ Author: Grant
 Date: 2025-01-29
 """
 
+# ---------------------------------------------------------------------------
+# PROJ database auto-discovery
+# Must run before any pyproj / PyOcto imports so the library can locate
+# proj.db.  On HPC clusters the conda env is often not fully activated, so
+# PROJ_DATA / PROJ_LIB are unset even though the files are present on disk.
+# ---------------------------------------------------------------------------
+import os as _os
+
+
+def _setup_proj_data() -> None:
+    """Set PROJ_DATA to the conda env's share/proj directory if not already set."""
+    if _os.environ.get('PROJ_DATA') or _os.environ.get('PROJ_LIB'):
+        return  # already configured
+
+    import importlib.util as _ilu
+
+    # Locate pyproj without importing it (find_spec does not execute the module).
+    spec = _ilu.find_spec('pyproj')
+    if spec is None:
+        return
+
+    locs = getattr(spec, 'submodule_search_locations', None)
+    pkg_dir = list(locs)[0] if locs else _os.path.dirname(spec.origin or '')
+
+    # Walk up the directory tree (site-packages → lib → python3.x → lib →
+    # envroot) looking for share/proj/proj.db – typically 4-6 levels up.
+    current = pkg_dir
+    for _ in range(8):
+        proj_dir = _os.path.join(current, 'share', 'proj')
+        if _os.path.isfile(_os.path.join(proj_dir, 'proj.db')):
+            _os.environ['PROJ_DATA'] = proj_dir
+            break
+        current = _os.path.dirname(current)
+
+
+_setup_proj_data()
+del _setup_proj_data
+# ---------------------------------------------------------------------------
+
 import json
 import logging
 import sys
