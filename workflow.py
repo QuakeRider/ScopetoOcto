@@ -29,29 +29,51 @@ import os as _os
 
 
 def _setup_proj_data() -> None:
-    """Set PROJ_DATA to the conda env's share/proj directory if not already set."""
-    if _os.environ.get('PROJ_DATA') or _os.environ.get('PROJ_LIB'):
-        return  # already configured
+    """Set PROJ_DATA and PROJ_LIB to the conda env's share/proj directory.
 
-    import importlib.util as _ilu
+    Only skips if an existing env var already points at a valid proj.db so
+    that a stale / wrong PROJ_DATA set by the HPC module system is overridden.
+    Sets both PROJ_DATA (PROJ 9+) and PROJ_LIB (PROJ 8 and earlier) for
+    maximum compatibility.
+    """
+    def _has_proj_db(path: str) -> bool:
+        return bool(path) and _os.path.isfile(_os.path.join(path, 'proj.db'))
 
-    # Locate pyproj without importing it (find_spec does not execute the module).
-    spec = _ilu.find_spec('pyproj')
-    if spec is None:
+    # Honour existing env vars only when they actually point at a valid proj.db.
+    if _has_proj_db(_os.environ.get('PROJ_DATA', '')) or \
+            _has_proj_db(_os.environ.get('PROJ_LIB', '')):
         return
 
-    locs = getattr(spec, 'submodule_search_locations', None)
-    pkg_dir = list(locs)[0] if locs else _os.path.dirname(spec.origin or '')
+    import sys as _sys
+    import importlib.util as _ilu
 
-    # Walk up the directory tree (site-packages → lib → python3.x → lib →
-    # envroot) looking for share/proj/proj.db – typically 4-6 levels up.
-    current = pkg_dir
-    for _ in range(8):
-        proj_dir = _os.path.join(current, 'share', 'proj')
-        if _os.path.isfile(_os.path.join(proj_dir, 'proj.db')):
-            _os.environ['PROJ_DATA'] = proj_dir
+    candidates = []
+
+    # 1. sys.prefix is the conda / venv environment root – most direct path.
+    candidates.append(_os.path.join(_sys.prefix, 'share', 'proj'))
+
+    # 2. CONDA_PREFIX is set when the environment is properly activated.
+    conda_prefix = _os.environ.get('CONDA_PREFIX', '')
+    if conda_prefix:
+        candidates.append(_os.path.join(conda_prefix, 'share', 'proj'))
+
+    # 3. Walk up from the pyproj package directory (site-packages → … → envroot).
+    #    Locate pyproj without importing it so PROJ_DATA is set before the first
+    #    pyproj import (find_spec does not execute the module).
+    spec = _ilu.find_spec('pyproj')
+    if spec is not None:
+        locs = getattr(spec, 'submodule_search_locations', None)
+        pkg_dir = list(locs)[0] if locs else _os.path.dirname(spec.origin or '')
+        current = pkg_dir
+        for _ in range(8):
+            candidates.append(_os.path.join(current, 'share', 'proj'))
+            current = _os.path.dirname(current)
+
+    for proj_dir in candidates:
+        if _has_proj_db(proj_dir):
+            _os.environ['PROJ_DATA'] = proj_dir  # PROJ 9+
+            _os.environ['PROJ_LIB'] = proj_dir   # PROJ 8 and earlier
             break
-        current = _os.path.dirname(current)
 
 
 _setup_proj_data()
