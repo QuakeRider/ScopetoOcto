@@ -35,7 +35,18 @@ def _setup_proj_data() -> None:
     that a stale / wrong PROJ_DATA set by the HPC module system is overridden.
     Sets both PROJ_DATA (PROJ 9+) and PROJ_LIB (PROJ 8 and earlier) for
     maximum compatibility.
+
+    Also disables PROJ's network datum-grid downloads (PROJ_NETWORK=OFF) unless
+    the caller has already opted in with PROJ_NETWORK=ON.  On HPC compute nodes
+    outbound HTTPS is often blocked, causing crs.to_wkt() / to_proj4() to hang
+    silently while PROJ tries to fetch datum grids from cdn.proj.org.  Disabling
+    the network makes those calls return immediately and avoids the
+    "pyproj unable to set PROJ database path" CA-bundle warning.
     """
+    # Disable PROJ network datum downloads unless the user explicitly opts in.
+    # Must be set before any pyproj / PROJ C library initialisation.
+    _os.environ.setdefault('PROJ_NETWORK', 'OFF')
+
     def _has_proj_db(path: str) -> bool:
         return bool(path) and _os.path.isfile(_os.path.join(path, 'proj.db'))
 
@@ -420,6 +431,13 @@ def download_and_format_picks(
 
 def main():
     """Command-line interface."""
+    # Force line-buffered stdout so that every print() call is flushed
+    # immediately.  When the script is run inside an HPC batch job its stdout
+    # is redirected to a log file, which switches Python to full (block)
+    # buffering.  Without this, progress output can be invisible for minutes at
+    # a time while the buffer slowly fills up.
+    sys.stdout.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(
         description='Download QuakeScope picks and format for PyOcto',
         formatter_class=argparse.RawDescriptionHelpFormatter,
