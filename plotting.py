@@ -188,10 +188,15 @@ class PicksPlotter:
     def _read_date_dir(date_dir: Path):
         """Read all pick CSVs under a single date directory.
 
+        Expects *date_dir* to sit at depth YYYY/MM/DD inside the picks
+        directory.  The date string is reconstructed from the three path
+        components so it is always in ``YYYY-MM-DD`` form regardless of
+        directory depth.
+
         Returns a DataFrame with a ``_date_str`` column, or None if the
         directory contained no readable data.
         """
-        date_str = date_dir.name
+        date_str = f"{date_dir.parent.parent.name}-{date_dir.parent.name}-{date_dir.name}"
         chunks   = []
         for fp in sorted(date_dir.glob("*.csv")):
             try:
@@ -204,19 +209,20 @@ class PicksPlotter:
         return pd.concat(chunks, ignore_index=True) if chunks else None
 
     def _load_all_picks(self):
-        """Scan picks/YYYY-MM-DD/*.csv and build self.all_picks.
+        """Scan picks/YYYY/MM/DD/*.csv and build self.all_picks.
 
-        Date directories are processed in parallel via a ThreadPoolExecutor,
-        which gives a large speed-up when there are hundreds of date
-        directories each containing thousands of station CSV files.
+        Date directories (the leaf DD directories under YYYY/MM/) are
+        processed in parallel via a ThreadPoolExecutor, which gives a large
+        speed-up when there are hundreds of date directories each containing
+        thousands of station CSV files.
         """
         if not self.picks_dir.exists():
             raise FileNotFoundError(f"Picks directory not found: {self.picks_dir}")
 
-        # Discover date directories (direct children of picks_dir) that
+        # Discover leaf day-directories at picks_dir/YYYY/MM/DD that
         # contain at least one CSV file.
         date_dirs = sorted(
-            d for d in self.picks_dir.iterdir()
+            d for d in self.picks_dir.glob("*/*/*")
             if d.is_dir() and any(d.glob("*.csv"))
         )
         if not date_dirs:
@@ -481,8 +487,11 @@ class PicksPlotter:
                 try:
                     fig = self._station_figure(sta_id, picks)
                     safe = sta_id.replace(".", "_").strip("_")
+                    network = sta_id.split(".")[0]
+                    net_dir = self.station_plots_dir / network
+                    net_dir.mkdir(parents=True, exist_ok=True)
                     fig.savefig(
-                        self.station_plots_dir / f"{safe}.png",
+                        net_dir / f"{safe}.png",
                         dpi=150, bbox_inches="tight",
                     )
                     pdf.savefig(fig, bbox_inches="tight")

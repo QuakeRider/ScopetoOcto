@@ -133,7 +133,7 @@ def _dedup_day_dir(
         deduped.to_csv(out_path, index=False)
 
         messages.append(
-            f"  {day_dir.name}/{out_path.name}: "
+            f"  {day_dir.parent.parent.name}/{day_dir.parent.name}/{day_dir.name}/{out_path.name}: "
             f"{n_src} picks → {len(deduped)} after dedup "
             f"({len(fpaths)} location file(s) merged)"
         )
@@ -239,7 +239,7 @@ class QuakeScopePicksDownloader:
         end_date = end_dt.date()
 
         while current <= end_date:
-            day_dir = self.output_dir / str(current)
+            day_dir = self.output_dir / str(current.year) / f"{current.month:02d}" / f"{current.day:02d}"
             day_dir.mkdir(parents=True, exist_ok=True)
             day_dirs.append(day_dir)
             current += timedelta(days=1)
@@ -517,7 +517,7 @@ class QuakeScopePicksDownloader:
         """Write a formatted picks DataFrame to per-day files, split by date.
 
         Each calendar day found in *formatted_df* is written to
-        ``output_dir/YYYY-MM-DD/{station_clean}_picks.csv``.  If a file
+        ``output_dir/YYYY/MM/DD/{station_clean}_picks.csv``.  If a file
         already exists for a station-day it is **skipped** (not overwritten or
         appended to), so an interrupted run can be resumed safely by simply
         re-running — days already on disk are left untouched.
@@ -530,7 +530,7 @@ class QuakeScopePicksDownloader:
             station_name = day_df['station'].iloc[0]
             station_clean = station_name.replace('.', '_').replace(' ', '_')
 
-            day_dir = self.output_dir / str(day_date)
+            day_dir = self.output_dir / str(day_date.year) / f"{day_date.month:02d}" / f"{day_date.day:02d}"
             day_dir.mkdir(parents=True, exist_ok=True)
             filepath = day_dir / f"{station_clean}_picks.csv"
 
@@ -539,7 +539,7 @@ class QuakeScopePicksDownloader:
                 continue
 
             day_df.to_csv(filepath, index=False)
-            print(f"  Wrote {len(day_df)} picks → {day_date}/{filepath.name}")
+            print(f"  Wrote {len(day_df)} picks → {day_date.year}/{day_date.month:02d}/{day_date.day:02d}/{filepath.name}")
             if hasattr(self, '_immediate_files'):
                 self._immediate_files.append(filepath)
 
@@ -1020,7 +1020,7 @@ class QuakeScopePicksDownloader:
             tid_clean = row['tid'].replace('.', '_')
             tid_to_phys[tid_clean] = row['physical_station']
 
-        day_dirs = [d for d in sorted(self.output_dir.iterdir()) if d.is_dir()]
+        day_dirs = sorted(d for d in self.output_dir.glob("*/*/*") if d.is_dir())
         merged_count = 0
 
         if effective_workers == 1 or len(day_dirs) <= 1:
