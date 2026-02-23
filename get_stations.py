@@ -293,11 +293,27 @@ def create_pyocto_stations_df(
     
     try:
         from pyocto import OctoAssociator
+        import pyproj
         from pyproj import CRS
     except ImportError:
         print("ERROR: PyOcto not installed. Install with: pip install pyocto")
         print("Falling back to simple approximation (NOT RECOMMENDED)")
         return _create_stations_simple_approx(stations_df), None
+
+    # Explicitly set the PROJ data directory via pyproj's Python API.
+    # Setting PROJ_DATA env vars alone is unreliable on HPC clusters because
+    # the PROJ C library caches its context path at load time; calling
+    # pyproj.datadir.set_data_dir() after import correctly updates that context.
+    import os as _os, sys as _sys
+    for _proj_candidate in (
+        _os.environ.get('PROJ_DATA', ''),
+        _os.environ.get('PROJ_LIB', ''),
+        _os.path.join(_sys.prefix, 'share', 'proj'),
+    ):
+        if _proj_candidate and _os.path.isfile(_os.path.join(_proj_candidate, 'proj.db')):
+            pyproj.datadir.set_data_dir(_proj_candidate)
+            break
+    del _os, _sys, _proj_candidate
     
     # Collapse to one entry per physical station (NET.STA) for the PyOcto
     # coordinate frame.  When stations_df was produced by get_stations_with_metadata
