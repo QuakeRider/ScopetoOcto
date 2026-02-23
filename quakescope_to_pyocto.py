@@ -132,8 +132,9 @@ def _dedup_day_dir(
         n_src = len(merged)
         deduped.to_csv(out_path, index=False)
 
+        day_label = f"{day_dir.parent.parent.name}/{day_dir.parent.name}/{day_dir.name}"
         messages.append(
-            f"  {day_dir.name}/{out_path.name}: "
+            f"  {day_label}/{out_path.name}: "
             f"{n_src} picks → {len(deduped)} after dedup "
             f"({len(fpaths)} location file(s) merged)"
         )
@@ -239,13 +240,18 @@ class QuakeScopePicksDownloader:
         end_date = end_dt.date()
 
         while current <= end_date:
-            day_dir = self.output_dir / str(current)
+            day_dir = (
+                self.output_dir
+                / str(current.year)
+                / f"{current.month:02d}"
+                / f"{current.day:02d}"
+            )
             day_dir.mkdir(parents=True, exist_ok=True)
             day_dirs.append(day_dir)
             current += timedelta(days=1)
 
         print(f"Created {len(day_dirs)} day director{'y' if len(day_dirs) == 1 else 'ies'} "
-              f"under {self.output_dir}")
+              f"under {self.output_dir} (YYYY/MM/DD layout)")
         return day_dirs
     
     def get_active_days_for_station(self,
@@ -530,7 +536,12 @@ class QuakeScopePicksDownloader:
             station_name = day_df['station'].iloc[0]
             station_clean = station_name.replace('.', '_').replace(' ', '_')
 
-            day_dir = self.output_dir / str(day_date)
+            day_dir = (
+                self.output_dir
+                / str(day_date.year)
+                / f"{day_date.month:02d}"
+                / f"{day_date.day:02d}"
+            )
             day_dir.mkdir(parents=True, exist_ok=True)
             filepath = day_dir / f"{station_clean}_picks.csv"
 
@@ -1020,7 +1031,8 @@ class QuakeScopePicksDownloader:
             tid_clean = row['tid'].replace('.', '_')
             tid_to_phys[tid_clean] = row['physical_station']
 
-        day_dirs = [d for d in sorted(self.output_dir.iterdir()) if d.is_dir()]
+        # Collect all leaf day directories (YYYY/MM/DD) under output_dir.
+        day_dirs = sorted(d for d in self.output_dir.glob('*/*/*') if d.is_dir())
         merged_count = 0
 
         if effective_workers == 1 or len(day_dirs) <= 1:
@@ -1110,10 +1122,11 @@ class QuakeScopePicksDownloader:
         for key, df in organized_picks.items():
             # Key format: "{station_clean}_{YYYY-MM-DD}"
             # Extract the trailing date (always 10 chars: YYYY-MM-DD) to build
-            # the date subdirectory, leaving the station name for the filename.
+            # the YYYY/MM/DD directory tree, leaving the station name for the filename.
             date_str = key[-10:]
             station_part = key[:-11]  # strip "_{date}"
-            day_dir = self.output_dir / date_str
+            year, month, day = date_str[:4], date_str[5:7], date_str[8:10]
+            day_dir = self.output_dir / year / month / day
             day_dir.mkdir(parents=True, exist_ok=True)
 
             if format == 'csv':

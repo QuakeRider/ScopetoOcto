@@ -14,7 +14,7 @@ stored in crs_info.json.
 Output layout (inside <output_dir>/):
     plots/
         per_station_figures.pdf          — all station figures in one PDF
-        stations/<NET_STA_>.png          — individual station PNGs
+        stations/<NETWORK>/<NET_STA_>.png — station PNGs grouped by network
         summary/
             summary_fig1_geographic.png/pdf
             summary_fig3_temporal_stats.png/pdf
@@ -188,10 +188,15 @@ class PicksPlotter:
     def _read_date_dir(date_dir: Path):
         """Read all pick CSVs under a single date directory.
 
+        Expects date_dir to be a YYYY/MM/DD leaf directory.  The ISO date
+        string is reconstructed from the three path components so it is
+        always well-formed regardless of how the directory was traversed.
+
         Returns a DataFrame with a ``_date_str`` column, or None if the
         directory contained no readable data.
         """
-        date_str = date_dir.name
+        # Reconstruct YYYY-MM-DD from the three-level path components.
+        date_str = f"{date_dir.parent.parent.name}-{date_dir.parent.name}-{date_dir.name}"
         chunks   = []
         for fp in sorted(date_dir.glob("*.csv")):
             try:
@@ -204,7 +209,7 @@ class PicksPlotter:
         return pd.concat(chunks, ignore_index=True) if chunks else None
 
     def _load_all_picks(self):
-        """Scan picks/YYYY-MM-DD/*.csv and build self.all_picks.
+        """Scan picks/YYYY/MM/DD/*.csv and build self.all_picks.
 
         Date directories are processed in parallel via a ThreadPoolExecutor,
         which gives a large speed-up when there are hundreds of date
@@ -213,10 +218,10 @@ class PicksPlotter:
         if not self.picks_dir.exists():
             raise FileNotFoundError(f"Picks directory not found: {self.picks_dir}")
 
-        # Discover date directories (direct children of picks_dir) that
-        # contain at least one CSV file.
+        # Discover leaf day directories (YYYY/MM/DD) that contain at least
+        # one CSV file.
         date_dirs = sorted(
-            d for d in self.picks_dir.iterdir()
+            d for d in self.picks_dir.glob("*/*/*")
             if d.is_dir() and any(d.glob("*.csv"))
         )
         if not date_dirs:
@@ -481,8 +486,12 @@ class PicksPlotter:
                 try:
                     fig = self._station_figure(sta_id, picks)
                     safe = sta_id.replace(".", "_").strip("_")
+                    # Group PNGs by network: stations/{NETWORK}/{NET_STA_}.png
+                    network = sta_id.split(".")[0]
+                    net_dir = self.station_plots_dir / network
+                    net_dir.mkdir(parents=True, exist_ok=True)
                     fig.savefig(
-                        self.station_plots_dir / f"{safe}.png",
+                        net_dir / f"{safe}.png",
                         dpi=150, bbox_inches="tight",
                     )
                     pdf.savefig(fig, bbox_inches="tight")
