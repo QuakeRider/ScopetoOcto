@@ -64,6 +64,11 @@ def _setup_proj_data() -> None:
     if spec is not None:
         locs = getattr(spec, 'submodule_search_locations', None)
         pkg_dir = list(locs)[0] if locs else _os.path.dirname(spec.origin or '')
+
+        # pip-installed pyproj bundles proj.db inside the package itself at
+        # <package>/proj_dir/share/proj/proj.db — check there first.
+        candidates.append(_os.path.join(pkg_dir, 'proj_dir', 'share', 'proj'))
+
         current = pkg_dir
         for _ in range(8):
             candidates.append(_os.path.join(current, 'share', 'proj'))

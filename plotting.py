@@ -70,7 +70,23 @@ try:
             os.environ.setdefault("PROJ_LIB",  str(_p))
             break
 
+    import pyproj as _pyproj_mod
     from pyproj import Transformer, CRS as ProjCRS
+
+    # Explicitly update the PROJ C-library context so it can locate proj.db.
+    # On HPC clusters the PROJ C library may have cached its context path at
+    # shared-library load time, so setting env vars alone is not sufficient;
+    # calling set_data_dir() after import directly updates that context.
+    for _proj_dir in [
+        os.environ.get("PROJ_DATA", ""),
+        os.environ.get("PROJ_LIB", ""),
+        os.path.join(sys.prefix, "share", "proj"),
+    ]:
+        if _proj_dir and os.path.isfile(os.path.join(_proj_dir, "proj.db")):
+            _pyproj_mod.datadir.set_data_dir(_proj_dir)
+            break
+    del _pyproj_mod
+
     HAS_PYPROJ = True
 except ImportError:
     HAS_PYPROJ = False
